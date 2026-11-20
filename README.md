@@ -1,6 +1,6 @@
 # Rustym
 
-A small, fast, **ad-free YouTube Music player for Linux**, written in Rust.
+A small, fast, **ad-free YouTube Music player for Linux**, written in Rust just uses (~90MB RAM).
 
 Rustym gives you a native desktop UI (built with [egui](https://github.com/emilk/egui)) on top of
 [mpv](https://mpv.io) and [yt-dlp](https://github.com/yt-dlp/yt-dlp). Sign in with your Google account
