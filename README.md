@@ -111,4 +111,5 @@ in place) and removes the old `ytm` binary and launcher. Note the environment va
 
 ## License
 
-No license file was included with the source. Add one (for example MIT or GPL-3.0) before distributing.
+No license file was included with the source. 
+
