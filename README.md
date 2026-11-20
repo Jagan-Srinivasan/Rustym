@@ -95,11 +95,6 @@ Everything lives in `~/.config/rustym/` (or `$XDG_CONFIG_HOME/rustym/`):
 | `login-profile/` | Rustym's private browser profile used for sign-in |
 | `debug.log`, `mpv.log` | diagnostics |
 
-## Upgrading from the old "ytm" name
-
-`install.sh` copies `~/.config/ytm` to `~/.config/rustym` the first time it runs (your old data is left
-in place) and removes the old `ytm` binary and launcher. Note the environment variable was renamed from
-`YTM_BROWSER` to `RUSTYM_BROWSER`.
 
 ## Privacy and security
 
