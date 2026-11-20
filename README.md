@@ -28,7 +28,7 @@ audio visualiser — with no ads and no browser tab running in the background.
 <table>
   <tr>
     <td align="center">
-      <img src="https://github.com/user-attachments/assets/c853a686-5499-4a52-af0d-b51fa5e93062" width="100%" />
+      <img src="https://github.com/user-attachments/assets/4c90d84e-5535-4446-a70b-e3fbc3b66623"width="100%" />
     </td>
     <td align="center">
       <img src="https://github.com/user-attachments/assets/19d54090-a755-42cf-870e-7dc57910e063" width="100%" />
