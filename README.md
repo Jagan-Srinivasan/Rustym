@@ -23,16 +23,34 @@ audio visualiser — with no ads and no browser tab running in the background.
 - Built-in **diagnostics and debug log** page that checks mpv, yt-dlp, python, deno, your login and
   does a real playback test
 - Hyprland-aware window hiding for tray mode
+## Screenshots
 
--<img width="1918" height="1080" alt="screenshot_2026-11-20_13-28-57" src="https://github.com/user-attachments/assets/c853a686-5499-4a52-af0d-b51fa5e93062" />
-<img width="1270" height="612" alt="screenshot_2026-11-20_13-29-22" src="https://github.com/user-attachments/assets/19d54090-a755-42cf-870e-7dc57910e063" />
-
-
-- <img width="1919" height="1080" alt="screenshot_2026-11-20_13-26-26" src="https://github.com/user-attachments/assets/9a1a3c77-b8b7-433f-830e-a46ea6948772" />
-<img width="1918" height="1080" alt="screenshot_2026-11-20_13-27-06" src="https://github.com/user-attachments/assets/b31ffb90-8290-49ad-84e3-a4c0ea603227" />
-<img width="1918" height="1080" alt="screenshot_2026-11-20_13-27-15" src="https://github.com/user-attachments/assets/6370172f-c9e3-4c1f-8b48-632b50cae683" />
-<img width="1918" height="1080" alt="screenshot_2026-11-20_13-27-26" src="https://github.com/user-attachments/assets/37c808fa-4567-4e40-be52-410be70c1888" />
-
+<table>
+  <tr>
+    <td align="center">
+      <img src="https://github.com/user-attachments/assets/c853a686-5499-4a52-af0d-b51fa5e93062" width="100%" />
+    </td>
+    <td align="center">
+      <img src="https://github.com/user-attachments/assets/19d54090-a755-42cf-870e-7dc57910e063" width="100%" />
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="https://github.com/user-attachments/assets/9a1a3c77-b8b7-433f-830e-a46ea6948772" width="100%" />
+    </td>
+    <td align="center">
+      <img src="https://github.com/user-attachments/assets/b31ffb90-8290-49ad-84e3-a4c0ea603227" width="100%" />
+    </td>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="https://github.com/user-attachments/assets/6370172f-c9e3-4c1f-8b48-632b50cae683" width="100%" />
+    </td>
+    <td align="center">
+      <img src="https://github.com/user-attachments/assets/37c808fa-4567-4e40-be52-410be70c1888" width="100%" />
+    </td>
+  </tr>
+</table>
 
 
 
