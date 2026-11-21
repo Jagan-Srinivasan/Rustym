@@ -135,7 +135,7 @@ Everything lives in `~/.config/rustym/` (or `$XDG_CONFIG_HOME/rustym/`):
 - Use **Settings → Sign out** to delete the saved cookies and private browser profile.
 
 ## 🔑 License
+LinSpot is licensed under the GNU General Public License v3.0.
+Copyright (C) 2026 Jagan S.
 
-LinSpot is licensed under the [MIT License](LICENSE).
-
-Copyright (c) 2026 Jagan S.
+See [LICENSE](LICENSE) for the full license text.
