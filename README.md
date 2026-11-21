@@ -134,7 +134,8 @@ Everything lives in `~/.config/rustym/` (or `$XDG_CONFIG_HOME/rustym/`):
   thumbnails over HTTP. There is no telemetry.
 - Use **Settings → Sign out** to delete the saved cookies and private browser profile.
 
-## License
+## 🔑 License
 
-No license file was included with the source. 
+LinSpot is licensed under the [MIT License](LICENSE).
 
+Copyright (c) 2026 Jagan S.
