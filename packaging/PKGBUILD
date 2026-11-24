@@ -26,6 +26,12 @@ prepare() {
 build() {
     cd "$(_srcdir)"
     export CARGO_HOME="$srcdir/.cargo-home"
+    # makepkg's default `lto` option adds -flto=auto to CFLAGS; GCC LTO bytecode
+    # objects are incompatible with the lld linker that rustc (>= 1.90) uses by
+    # default -> undefined ring crate symbols at link time. Drop it here.
+    export CFLAGS="${CFLAGS/-flto=auto/}"
+    export CXXFLAGS="${CXXFLAGS/-flto=auto/}"
+    unset RUSTFLAGS  # e.g. -C target-cpu=native from user makepkg.conf; not portable
     # --locked: build strictly from Cargo.lock, but allow fetching crates from crates.io
     cargo build --release --locked
 }
@@ -35,6 +41,7 @@ package() {
     install -Dm755 target/release/rustym -t "$pkgdir/usr/bin/"
     install -Dm755 target/release/rustym-login -t "$pkgdir/usr/bin/"
     install -Dm644 packaging/rustym.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/rustym.svg"
+    mkdir -p "$pkgdir/usr/share/applications"
     sed 's|@BIN@|/usr/bin|g' packaging/rustym.desktop.in > "$pkgdir/usr/share/applications/rustym.desktop"
     chmod 644 "$pkgdir/usr/share/applications/rustym.desktop"
 }
