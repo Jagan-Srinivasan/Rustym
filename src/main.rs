@@ -621,18 +621,13 @@ fn bar(ui: &mut egui::Ui, th: Theme, frac: f32, width: f32) -> egui::Response {
 }
 
 fn nav_item(ui: &mut egui::Ui, th: Theme, icon: Glyph, label: &str, active: bool) -> egui::Response {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 40.0), Sense::click());
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 38.0), Sense::click());
     let k = ui.ctx().animate_bool(resp.id, resp.hovered());
     let p = ui.painter();
     if active {
-        p.rect_filled(rect, 10.0, th.card2);
-        p.rect_filled(
-            Rect::from_min_size(Pos2::new(rect.left(), rect.center().y - 10.0), Vec2::new(3.0, 20.0)),
-            2.0,
-            th.accent,
-        );
+        p.rect_filled(rect, 10.0, th.accent.gamma_multiply(0.15));
     } else if k > 0.01 {
-        p.rect_filled(rect, 10.0, th.card.gamma_multiply(k));
+        p.rect_filled(rect, 10.0, th.accent.gamma_multiply(0.08 * k));
     }
     let col = if active { th.accent } else { lerp_col(th.dim2, th.text, k) };
     draw_glyph(p, icon, Pos2::new(rect.left() + 24.0, rect.center().y), col);
@@ -640,7 +635,7 @@ fn nav_item(ui: &mut egui::Ui, th: Theme, icon: Glyph, label: &str, active: bool
         Pos2::new(rect.left() + 46.0, rect.center().y),
         Align2::LEFT_CENTER,
         label,
-        FontId::proportional(15.0),
+        FontId::proportional(14.5),
         if active { th.text } else { lerp_col(th.dim2, th.text, k) },
     );
     if resp.hovered() {
@@ -1767,34 +1762,49 @@ impl Rustym {
                     ));
                     ui.label(RichText::new("Rustym").size(22.0).strong().color(th.text));
                 });
-                ui.add_space(22.0);
-                let items: [(&str, View, Glyph); 12] = [
-                    ("Home", View::Home, Glyph::Home),
-                    ("Search", View::Search, Glyph::Search),
-                    ("Liked songs", View::Liked, Glyph::Heart),
-                    ("Albums", View::Albums, Glyph::List),
-                    ("Artists", View::Artists, Glyph::List),
-                    ("Playlists", View::Playlists, Glyph::List),
-                    ("History", View::History, Glyph::Wave),
-                    ("Local files", View::Local, Glyph::List),
-                    ("Stats", View::Stats, Glyph::Wave),
-                    ("Now playing", View::Now, Glyph::Wave),
-                    ("Settings", View::Settings, Glyph::Gear),
-                    ("Debug logs", View::Logs, Glyph::List),
+                ui.add_space(20.0);
+
+                // Slim navigation: everything else lives as tabs inside the pages
+                // (Albums/Artists -> tabs, Stats/Debug logs -> Settings tabs,
+                // Now playing -> opens automatically and via the player bar).
+                let is_library = matches!(self.view, View::Albums | View::Artists);
+                let is_system = matches!(self.view, View::Settings | View::Stats | View::Logs);
+                let sections: [(&str, Vec<(&str, bool, Glyph, View)>); 3] = [
+                    (
+                        "MENU",
+                        vec![
+                            ("Home", self.view == View::Home || matches!(self.view, View::Mix(_)), Glyph::Home, View::Home),
+                            ("Search", self.view == View::Search, Glyph::Search, View::Search),
+                        ],
+                    ),
+                    (
+                        "LIBRARY",
+                        vec![
+                            ("Liked songs", self.view == View::Liked, Glyph::Heart, View::Liked),
+                            ("Playlists", self.view == View::Playlists || matches!(self.view, View::Playlist(_) | View::Remote(_)), Glyph::List, View::Playlists),
+                            ("Albums & Artists", is_library, Glyph::List, View::Albums),
+                            ("History", self.view == View::History, Glyph::Wave, View::History),
+                            ("Local files", self.view == View::Local, Glyph::List, View::Local),
+                        ],
+                    ),
+                    (
+                        "SYSTEM",
+                        vec![("Settings", is_system, Glyph::Gear, View::Settings)],
+                    ),
                 ];
-                let nav_h = (ui.available_height() - 120.0).max(120.0);
+                let nav_h = (ui.available_height() - 120.0).max(160.0);
                 egui::ScrollArea::vertical().max_height(nav_h).auto_shrink([false, true]).show(ui, |ui| {
-                    for (name, v, g) in items {
-                        let active = match (self.view, v) {
-                            (View::Playlist(_), View::Playlists) => true,
-                            (View::Mix(_), View::Home) => true,
-                            (View::Remote(_), View::Playlists) => true,
-                            (a, b) => a == b,
-                        };
-                        if nav_item(ui, th, g, name, active).clicked() {
-                            self.back.clear();
-                            self.go(ctx, v);
+                    for (section, items) in sections {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(section).size(9.5).strong().color(th.dim));
+                        ui.add_space(4.0);
+                        for (name, active, g, v) in items {
+                            if nav_item(ui, th, g, name, active).clicked() {
+                                self.back.clear();
+                                self.go(ctx, v);
+                            }
                         }
+                        ui.add_space(6.0);
                     }
                 });
 
@@ -1862,14 +1872,19 @@ impl Rustym {
                             }
                             ui.vertical(|ui| {
                                 ui.add_space(8.0);
-                                ui.add(
-                                    egui::Label::new(RichText::new(&t.title).size(15.0).strong().color(th.text))
-                                        .wrap_mode(egui::TextWrapMode::Truncate),
-                                );
-                                ui.add(
-                                    egui::Label::new(RichText::new(&t.artist).size(13.0).color(th.dim))
-                                        .wrap_mode(egui::TextWrapMode::Truncate),
-                                );
+                                // Clicking the track info opens the Now Playing page
+                                if ui.add(egui::Label::new(RichText::new(&t.title).size(15.0).strong().color(th.text)).wrap_mode(egui::TextWrapMode::Truncate).sense(Sense::click())).clicked() {
+                                    self.view = View::Now;
+                                    self.label = "Now playing".into();
+                                    self.status.clear();
+                                    self.back.clear();
+                                }
+                                if ui.add(egui::Label::new(RichText::new(&t.artist).size(13.0).color(th.dim)).wrap_mode(egui::TextWrapMode::Truncate).sense(Sense::click())).clicked() {
+                                    self.view = View::Now;
+                                    self.label = "Now playing".into();
+                                    self.status.clear();
+                                    self.back.clear();
+                                }
                             });
                         }
                         None => {
@@ -2532,7 +2547,7 @@ impl Rustym {
         let fid = egui::Id::new("log_filter");
         let mut filter: u8 = ui.data(|d| d.get_temp::<u8>(fid)).unwrap_or(0);
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.label(RichText::new("Debug logs").size(24.0).strong().color(th.text));
+            // Title + tabs are drawn by page_system_tabs.
             ui.label(
                 RichText::new(format!(
                     "{n_err} errors · {n_warn} warnings · {} entries · also saved to ~/.config/rustym/debug.log",
@@ -2638,11 +2653,50 @@ impl Rustym {
         ui.data_mut(|d| d.insert_temp(fid, filter));
     }
 
+    /// Settings, Listening stats and Debug logs share one page with tabs, so
+    /// the sidebar stays slim. The active tab follows `self.view`.
+    fn page_system_tabs(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let th = self.theme;
+        let (tab, title) = match self.view {
+            View::Stats => (1, "Listening stats"),
+            View::Logs => (2, "Debug logs"),
+            _ => (0, "Settings"),
+        };
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(title).size(24.0).strong().color(th.text));
+            if self.loading && tab == 0 {
+                ui.add_space(8.0);
+                spin(ui, th);
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if self.pill(ui, "Debug logs", tab == 2).clicked() && tab != 2 {
+                    self.go(ctx, View::Logs);
+                }
+                if self.pill(ui, "Listening stats", tab == 1).clicked() && tab != 1 {
+                    self.go(ctx, View::Stats);
+                }
+                if self.pill(ui, "General", tab == 0).clicked() && tab != 0 {
+                    self.go(ctx, View::Settings);
+                }
+            });
+        });
+        let msg = if !self.status.is_empty() { self.status.clone() } else { self.snap.error.clone() };
+        if !msg.is_empty() {
+            ui.add_space(6.0);
+            ui.label(RichText::new(msg).color(th.accent));
+        }
+        ui.add_space(10.0);
+        match tab {
+            1 => self.page_stats(ui, ctx),
+            2 => self.page_logs(ui, ctx),
+            _ => self.page_settings(ui, ctx),
+        }
+    }
+
     fn page_settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let th = self.theme;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.label(RichText::new("Settings").size(24.0).strong().color(th.text));
-            ui.add_space(16.0);
+            ui.add_space(4.0);
 
             ui.label(RichText::new("Theme").size(16.0).strong().color(th.text));
             ui.add_space(6.0);
@@ -2860,12 +2914,10 @@ impl Rustym {
                     View::Now => self.page_now(ui, ctx),
                     View::Playlists => self.page_playlists(ui, ctx),
                     View::Playlist(i) => self.page_playlist(ui, i),
-                    View::Settings => self.page_settings(ui, ctx),
-                    View::Logs => self.page_logs(ui, ctx),
+                    View::Settings | View::Stats | View::Logs => self.page_system_tabs(ui, ctx),
                     View::Albums => self.page_cards(ui, ctx, 0),
                     View::Artists => self.page_cards(ui, ctx, 1),
                     View::History => self.page_history(ui, ctx),
-                    View::Stats => self.page_stats(ui, ctx),
                     View::Local => self.page_local(ui, ctx),
                     View::Detail => self.page_detail(ui, ctx),
                 }

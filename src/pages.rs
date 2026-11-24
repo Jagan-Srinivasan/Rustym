@@ -1059,7 +1059,28 @@ impl Rustym {
 
     pub(crate) fn page_cards(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, k: u8) {
         let th = self.theme;
-        self.header(ui);
+        // Title row with Albums | Artists segmented tabs (one slim sidebar item).
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(&self.label).size(24.0).strong().color(th.text));
+            if self.loading {
+                ui.add_space(8.0);
+                spin(ui, th);
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if self.pill(ui, "Artists", k == 1).clicked() && k != 1 {
+                    self.go(ctx, View::Artists);
+                }
+                if self.pill(ui, "Albums", k == 0).clicked() && k != 0 {
+                    self.go(ctx, View::Albums);
+                }
+            });
+        });
+        let msg = if !self.status.is_empty() { self.status.clone() } else { self.snap.error.clone() };
+        if !msg.is_empty() {
+            ui.add_space(6.0);
+            ui.label(RichText::new(msg).color(th.accent));
+        }
+        ui.add_space(10.0);
         if !self.cfg.signed_in {
             self.empty(ui, "Sign in to see your library", "Your saved albums and artists show up here.");
             return;
@@ -1094,20 +1115,25 @@ impl Rustym {
         }
     }
 
-    pub(crate) fn page_history(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
+    pub(crate) fn page_history(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let th = self.theme;
         self.header(ui);
-        if self.cfg.signed_in {
-            ui.horizontal(|ui| {
-                if ui.selectable_label(!self.hist_local, "YouTube Music").clicked() {
+        ui.horizontal(|ui| {
+            if self.cfg.signed_in {
+                if self.pill(ui, "▶▶ YouTube Music", !self.hist_local).clicked() && self.hist_local {
                     self.hist_local = false;
                 }
-                if ui.selectable_label(self.hist_local, "On this device").clicked() {
+                if self.pill(ui, "▤ On this device", self.hist_local).clicked() && !self.hist_local {
                     self.hist_local = true;
                 }
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.add(egui::Button::new(RichText::new("◔  Listening stats").size(12.0).color(th.accent)).fill(th.card).rounding(12.0)).clicked() {
+                    self.go(ctx, View::Stats);
+                }
             });
-            ui.add_space(6.0);
-        }
+        });
+        ui.add_space(6.0);
         let groups: Vec<(String, Vec<Track>)> = if self.hist_local || !self.cfg.signed_in {
             let today = (store::now() as i64 + tz_offset()).div_euclid(86_400);
             let mut out: Vec<(String, Vec<Track>)> = vec![];
@@ -1166,7 +1192,7 @@ impl Rustym {
 
     pub(crate) fn page_stats(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
         let th = self.theme;
-        self.header(ui);
+        // Title + tabs are drawn by page_system_tabs.
         let (plays, secs, songs) = store::totals();
         if plays == 0 && secs < 1.0 {
             self.empty(ui, "No stats yet", "Rustym counts what you play on this device — nothing leaves your computer.");

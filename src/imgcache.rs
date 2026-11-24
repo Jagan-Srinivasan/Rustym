@@ -143,7 +143,7 @@ fn decode(bytes: &[u8], bw: u32, bh: u32) -> Option<(ColorImage, u32, u32, u32, 
     // but never upscale beyond the native size - a source with fewer pixels
     // than the box gains nothing from a bigger texture (the GPU stretches it
     // at paint time), and the hit rule keeps such entries cached forever.
-    let mut scale = (bw.max(1) as f32 / w as f32).max(bh.max(1) as f32 / h as f32).min(1.0).max(1e-6);
+    let scale = (bw.max(1) as f32 / w as f32).max(bh.max(1) as f32 / h as f32).min(1.0).max(1e-6);
     let (w2, h2) = ((w as f32 * scale).ceil() as u32, (h as f32 * scale).ceil() as u32);
     // Safety cap for gigantic sources
     let (mut w2, mut h2) = (w2, h2);
