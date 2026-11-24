@@ -825,15 +825,19 @@ impl Rustym {
         let mut go = false;
         let mut pick: Option<String> = None;
         ui.horizontal(|ui| {
-            let w = (ui.available_width() - 130.0).min(760.0);
-            let resp = ui
-                .scope(|ui| {
-                    ui.spacing_mut().interact_size.y = 44.0;
+            let w = (ui.available_width() - 150.0).min(900.0);
+            let resp = egui::Frame::none()
+                .fill(th.card2)
+                .rounding(26.0)
+                .inner_margin(Margin::symmetric(22.0, 12.0))
+                .show(ui, |ui| {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.query)
                             .hint_text("Search songs, albums, artists — or paste a YouTube link…")
-                            .font(FontId::proportional(16.0))
-                            .desired_width(w),
+                            .font(FontId::proportional(17.0))
+                            .frame(false)
+                            .desired_width(w)
+                            .min_size(Vec2::new(w, 34.0)),
                     )
                 })
                 .inner;
@@ -849,7 +853,7 @@ impl Rustym {
             if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 go = true;
             }
-            if ui.add_sized([110.0, 44.0], accent_button(th, "Search")).clicked() {
+            if ui.add_sized([120.0, 58.0], accent_button(th, "Search")).clicked() {
                 go = true;
             }
         });
