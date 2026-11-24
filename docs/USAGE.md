@@ -4,7 +4,7 @@
 
 1. Start Rustym (`rustym`, or from your app launcher).
 2. Click **Sign in with Google**. Rustym opens your chosen browser with a **private profile** that
-   belongs to Rustym only, at Google's sign-in page.
+   belongs to Rustym only, at Google's sign-in page. Each browser gets its own profile directory, so Firefox, Chrome, and Chromium never reuse your everyday browser profile or each other's profile data.
 3. Sign in normally (2-step verification works). Rustym detects the login automatically, verifies it
    against YouTube Music, and loads your liked songs and playlists.
 4. You can close the browser window afterwards.
@@ -39,9 +39,15 @@ crowd out songs.
 - **Theme** — Crimson, Ocean, Emerald, Violet, Sunset, Snow (light).
 - **Visualiser style** — Bars, Mirror, Radial.
 - **Browser used for Google sign-in** — firefox, chromium, brave, chrome, vivaldi, opera, edge.
-- **Keep playing in the background when the window is closed** — off by default, meaning closing the
-  window quits the app. When on, Rustym stays in the system tray; click the tray icon to show or hide
-  the window. Needs a tray host (see [DEPENDENCIES.md](DEPENDENCIES.md)).
+- **Close to tray** — off by default, meaning closing the window quits the app. When on, closing the
+  window really closes it (it is not just hidden) while the music, tray icon and media keys keep running.
+  Click the tray icon, launch Rustym again, or run `rustym --show` to get the window back. Needs a tray
+  host to show an icon (see [DEPENDENCIES.md](DEPENDENCIES.md)); without one a notification explains how to reopen.
+- **Liked songs** — saved on this computer (`liked_cache.json`); *Clear saved liked songs* removes the copy.
+- **Command line / keybindings** — `rustym --background` (start in the tray), `--show`, `--hide`, `--toggle`,
+  `--play-pause`, `--next`, `--prev`, `--quit`.
+- **Lyrics** — the Lyrics button in the player bar (or *Show lyrics* on Now playing) fetches and shows the
+  lyrics of the song that is playing. They are never looked up on their own, and hide again on the next song.
 - **Sign out** — deletes `cookies.txt` and the private login profile.
 - **Use cookies.txt** — an alternative to browser sign-in: put a Netscape-format cookies file at
   `~/.config/rustym/cookies.txt` (for example exported from your browser), then click this button and
@@ -61,8 +67,9 @@ crowd out songs.
 ```
 ~/.config/rustym/
 ├── config.json      settings, local playlists, recent tracks, cached remote playlist list
+├── liked_cache.json saved copy of your liked songs
 ├── cookies.txt      saved login (chmod 600)
-├── login-profile/   private browser profile used for sign-in
+├── login-profiles/<browser>/   separate private browser profile for each sign-in browser
 ├── debug.log        copy of the in-app log
 └── mpv.log          last mpv/yt-dlp messages (useful when a track will not play)
 /tmp/rustym-mpv.sock       mpv control socket
@@ -71,4 +78,4 @@ crowd out songs.
 
 ## Backing up playlists
 
-Copy `~/.config/rustym/config.json`. Do **not** share `cookies.txt` or `login-profile/`.
+Copy `~/.config/rustym/config.json`. Do **not** share `cookies.txt` or `login-profiles/<browser>/`.

@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Rustym
+GenericName=Music Player
+Comment=Ad-free YouTube Music
+Exec=@BIN@/rustym
+TryExec=@BIN@/rustym
+Icon=rustym
+Terminal=false
+Categories=AudioVideo;Audio;Player;Music;
+Keywords=music;youtube;player;audio;
+StartupNotify=false
+StartupWMClass=rustym

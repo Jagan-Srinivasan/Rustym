@@ -1,11 +1,16 @@
 //! Everything that is not drawing: data types, config, yt-dlp, mpv engine thread,
-//! audio visualiser capture, tray icon, Hyprland window hiding, single-instance.
+//! audio visualiser capture, tray icon, window lifecycle (close-to-tray), single-instance + CLI control.
 
 use serde::{Deserialize, Serialize};
+use rand::seq::SliceRandom;
 use serde_json::{json, Value};
 use std::{
+    collections::{HashMap, HashSet},
     io::{BufRead, BufReader, Read, Write},
-    os::unix::net::{UnixListener, UnixStream},
+    os::unix::{
+        fs::{MetadataExt, PermissionsExt},
+        net::{UnixListener, UnixStream},
+    },
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
@@ -16,33 +21,70 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub const SOCK: &str = "/tmp/rustym-mpv.sock";
-pub const LOCK: &str = "/tmp/rustym-instance.sock";
+/// Path of mpv's IPC socket. Lives in the per-user runtime dir (/run/user/UID) where available,
+/// so two users on one machine do not collide and other users cannot connect to it.
+pub fn sock() -> String {
+    if let Ok(d) = std::env::var("XDG_RUNTIME_DIR") {
+        if !d.is_empty() {
+            return format!("{d}/rustym-mpv.sock");
+        }
+    }
+    let uid = std::fs::metadata(config_dir()).map(|m| m.uid()).unwrap_or(0);
+    format!("/tmp/rustym-mpv-{uid}.sock")
+}
 pub const BANDS: usize = 48;
-pub const BROWSERS: [&str; 7] = ["firefox", "chromium", "brave", "chrome", "vivaldi", "opera", "edge"];
 
 static PAREC_PID: AtomicU32 = AtomicU32::new(0);
 
-/// Stops helper processes and removes sockets. Safe to call more than once.
-pub fn cleanup() {
+/// True once the tray icon has been registered.
+pub static TRAY_UP: AtomicBool = AtomicBool::new(false);
+
+/// Path of the single-instance / remote-control socket. Prefers the per-user runtime dir.
+pub fn lock_path() -> PathBuf {
+    if let Ok(d) = std::env::var("XDG_RUNTIME_DIR") {
+        if !d.is_empty() {
+            return PathBuf::from(d).join("rustym-instance.sock");
+        }
+    }
+    let uid = std::fs::metadata(config_dir()).map(|m| m.uid()).unwrap_or(0);
+    PathBuf::from(format!("/tmp/rustym-instance-{uid}.sock"))
+}
+
+/// Stops the visualiser's audio capture (the window process calls this when it closes).
+pub fn stop_viz() {
     let pid = PAREC_PID.swap(0, SeqCst);
     if pid != 0 {
         let _ = Command::new("kill").arg(pid.to_string()).stdout(Stdio::null()).stderr(Stdio::null()).status();
     }
-    let _ = std::fs::remove_file(SOCK);
-    let _ = std::fs::remove_file(LOCK);
+}
+
+/// Stops helper processes and removes sockets. Only the background process (the one that owns
+/// the engine) calls this, because it removes mpv's and the control socket. Safe to call twice.
+pub fn cleanup() {
+    stop_viz();
+    let _ = std::fs::remove_file(sock());
+    let _ = std::fs::remove_file(lock_path());
 }
 
 pub type Repaint = Arc<dyn Fn() + Send + Sync>;
 
 // ---------------- data ----------------
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Default, Debug)]
+#[serde(default)]
 pub struct Track {
     pub id: String,
     pub title: String,
     pub artist: String,
     pub dur: Option<f64>,
+    pub album: String,
+    /// YouTube Music browse ids, for "go to artist / album".
+    pub artist_id: String,
+    pub album_id: String,
+    /// Handle needed to remove this row from a YouTube playlist.
+    pub set_id: String,
+    /// Path of a local file (empty for YouTube tracks).
+    pub local: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -61,31 +103,68 @@ pub struct Playlist {
 #[serde(default)]
 pub struct Config {
     pub theme: usize,
+    /// Unused since sign-in moved into the app; kept so old config files still load.
     pub browser: String,
+    /// Google account name / avatar URL shown in the app (fetched after sign-in).
+    pub account_name: String,
+    pub account_photo: String,
     pub volume: f32,
     pub viz: usize,
+    /// Show the audio visualiser on the Now Playing page.
+    pub show_visualiser: bool,
+    /// UI zoom percentage (80–125).
+    pub ui_scale: f32,
+    /// Use tighter spacing throughout the interface.
+    pub compact_mode: bool,
+    /// Automatically show lyrics when Rustym starts; the Lyrics toggle updates this preference.
+    pub auto_show_lyrics: bool,
     pub signed_in: bool,
     /// Keep running (tray) when the window is closed. Off by default: closing the window quits.
     pub background: bool,
+    /// Open the player window minimised on launch.
+    pub start_minimised: bool,
+    /// Launch Rustym automatically when the desktop session starts.
+    pub start_at_login: bool,
     pub playlists: Vec<Playlist>,
     pub recent: Vec<Track>,
     pub trending: Vec<Track>,
     pub remote: Vec<RemotePl>,
+    pub fx: Fx,
+    pub shuffle: bool,
+    pub repeat: Repeat,
+    pub autoplay: bool,
+    /// Lyrics clock offset in milliseconds (positive = lyrics appear earlier).
+    pub lyrics_offset: i32,
+    pub local_dirs: Vec<String>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
-            theme: 0,
-            browser: "firefox".into(),
+            theme: 3, // Violet
+            browser: String::new(),
+            account_name: String::new(),
+            account_photo: String::new(),
             volume: 80.0,
             viz: 0,
+            show_visualiser: true,
+            ui_scale: 100.0,
+            compact_mode: false,
+            auto_show_lyrics: false,
             signed_in: false,
             background: false,
+            start_minimised: false,
+            start_at_login: false,
             playlists: vec![],
             recent: vec![],
             trending: vec![],
             remote: vec![],
+            fx: Fx::default(),
+            shuffle: false,
+            repeat: Repeat::Off,
+            autoplay: true,
+            lyrics_offset: 0,
+            local_dirs: vec!["~/Music".to_string()],
         }
     }
 }
@@ -101,13 +180,10 @@ pub fn config_dir() -> PathBuf {
 
 impl Config {
     pub fn load() -> Self {
-        let mut c: Config = std::fs::read_to_string(config_dir().join("config.json"))
+        let c: Config = std::fs::read_to_string(config_dir().join("config.json"))
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
-        if let Ok(b) = std::env::var("RUSTYM_BROWSER") {
-            c.browser = b;
-        }
         c
     }
     pub fn save(&self) {
@@ -115,6 +191,48 @@ impl Config {
             let _ = std::fs::write(config_dir().join("config.json"), s);
         }
     }
+}
+
+// ---------------- liked-songs cache (opens the Liked page instantly, works offline) ----------------
+
+fn liked_cache_path() -> PathBuf {
+    config_dir().join("liked_cache.json")
+}
+
+/// Liked songs saved by the last successful fetch (empty when there is no cache yet).
+pub fn liked_cache_load() -> Vec<Track> {
+    std::fs::read_to_string(liked_cache_path())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Replaces the cache. Written to a temp file first so a crash never leaves a half-written list.
+pub fn liked_cache_save(t: &[Track]) {
+    if let Ok(s) = serde_json::to_string(t) {
+        let p = liked_cache_path();
+        let tmp = config_dir().join("liked_cache.json.tmp");
+        if std::fs::write(&tmp, s).is_ok() {
+            let _ = std::fs::rename(&tmp, &p);
+        }
+    }
+}
+
+pub fn liked_cache_clear() {
+    let _ = std::fs::remove_file(liked_cache_path());
+}
+
+/// Keeps the cache in step with a like / unlike done inside Rustym.
+pub fn liked_cache_toggle(t: &Track, like: bool) {
+    let mut v = liked_cache_load();
+    if v.is_empty() {
+        return; // no cache yet: the next fetch creates it
+    }
+    v.retain(|x| x.id != t.id);
+    if like {
+        v.insert(0, t.clone());
+    }
+    liked_cache_save(&v);
 }
 
 // ---------------- debug log + diagnostics ----------------
@@ -141,7 +259,7 @@ static LOGS: Mutex<Vec<LogEntry>> = Mutex::new(Vec::new());
 static HEALTH: Mutex<Vec<Check>> = Mutex::new(Vec::new());
 static HEALTH_BUSY: AtomicBool = AtomicBool::new(false);
 
-fn tz_offset() -> i64 {
+pub fn tz_offset() -> i64 {
     static TZ: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
     *TZ.get_or_init(|| {
         let s = Command::new("date")
@@ -237,6 +355,16 @@ pub fn mpv_log_tail(n: usize) -> String {
     lines[from..].join("\n")
 }
 
+fn install_mpv() -> String {
+    crate::distro::install_hint(&[crate::distro::Pkg::Mpv])
+}
+fn install_ytdlp() -> String {
+    crate::distro::install_hint(&[crate::distro::Pkg::YtDlp])
+}
+fn install_deno() -> String {
+    crate::distro::install_hint(&[crate::distro::Pkg::Deno])
+}
+
 fn run_cmd(prog: &str, args: &[&str]) -> Result<(bool, String), String> {
     let o = Command::new(prog)
         .args(args)
@@ -274,14 +402,17 @@ pub fn run_health_checks(play: bool) {
             0,
             "system",
             format!(
-                "session={} wayland={} display={} config_dir={}",
+                "distro={} family={:?} desktop={} session={} wayland={} display={} config_dir={}",
+                crate::distro::pretty_name(),
+                crate::distro::family(),
+                crate::distro::desktop(),
                 std::env::var("XDG_SESSION_TYPE").unwrap_or_else(|_| "?".into()),
                 std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "-".into()),
                 std::env::var("DISPLAY").unwrap_or_else(|_| "-".into()),
                 config_dir().display()
             ),
         );
-        if let Ok((_, t)) = run_cmd("sh", &["-c", "pacman -Q mpv libjxl yt-dlp deno yt-dlp-ejs python ffmpeg 2>&1"]) {
+        if let Ok((_, t)) = run_cmd("sh", &["-c", crate::distro::query_installed_cmd()]) {
             for l in t.lines() {
                 log(0, "system", l);
             }
@@ -296,13 +427,13 @@ pub fn run_health_checks(play: bool) {
             }
             Ok((false, t)) => {
                 let fix = if t.contains("shared libraries") {
-                    "mpv is out of sync with its libraries: sudo pacman -Syu   (then: sudo pacman -S mpv)"
+                    format!("mpv is out of sync with its libraries: {}", crate::distro::upgrade_hint())
                 } else {
-                    "sudo pacman -S mpv"
+                    install_mpv()
                 };
-                push_check("mpv", 2, first_line(&t), fix);
+                push_check("mpv", 2, first_line(&t), &fix);
             }
-            Err(e) => push_check("mpv", 2, format!("cannot run mpv ({e})"), "sudo pacman -S mpv"),
+            Err(e) => push_check("mpv", 2, format!("cannot run mpv ({e})"), &install_mpv()),
         }
         if let Ok((_, t)) = run_cmd("sh", &["-c", r#"command -v mpv >/dev/null && ldd "$(command -v mpv)" 2>&1 | grep 'not found'"#]) {
             let miss: Vec<String> = t.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
@@ -315,7 +446,7 @@ pub fn run_health_checks(play: bool) {
                     "mpv libraries",
                     2,
                     miss.join("; "),
-                    "sudo pacman -Syu first. Still missing? find the owner with: sudo pacman -Fy ; pacman -F <libname>  then sudo pacman -S <package>",
+                    &crate::distro::missing_lib_hint(),
                 );
             }
         }
@@ -323,16 +454,13 @@ pub fn run_health_checks(play: bool) {
         // yt-dlp, python, deno
         match run_cmd("yt-dlp", &["--version"]) {
             Ok((true, t)) => push_check("yt-dlp", 0, format!("version {}", first_line(&t)), ""),
-            Ok((false, t)) => push_check("yt-dlp", 2, first_line(&t), "sudo pacman -S yt-dlp"),
-            Err(e) => push_check("yt-dlp", 2, format!("cannot run yt-dlp ({e})"), "sudo pacman -S yt-dlp"),
+            Ok((false, t)) => push_check("yt-dlp", 2, first_line(&t), &install_ytdlp()),
+            Err(e) => push_check("yt-dlp", 2, format!("cannot run yt-dlp ({e})"), &install_ytdlp()),
         }
-        match run_cmd("python3", &["--version"]) {
-            Ok((true, t)) => push_check("python3", 0, first_line(&t), ""),
-            _ => push_check("python3", 2, "not found - needed for YouTube library + Firefox login", "sudo pacman -S python"),
-        }
+        push_check("YouTube Music client", 0, "built in (pure Rust, no Python needed)", "");
         match run_cmd("deno", &["--version"]) {
             Ok((true, t)) => push_check("deno (JS runtime)", 0, first_line(&t), ""),
-            _ => push_check("deno (JS runtime)", 1, "not found - yt-dlp may fail to unlock streams", "sudo pacman -S deno yt-dlp-ejs"),
+            _ => push_check("deno (JS runtime)", 1, "not found - yt-dlp may fail to unlock streams", &install_deno()),
         }
 
         // login / session
@@ -346,7 +474,7 @@ pub fn run_health_checks(play: bool) {
                 .unwrap_or(0);
             if has_login_cookies(&cf) {
                 push_check("saved login", 0, format!("cookies.txt has Google login cookies (updated {age} min ago)"), "");
-                match api_call_once("verify", "") {
+                match crate::ytm::verify() {
                     Ok(_) => {
                         push_check("YouTube Music session", 0, "YouTube Music accepts the saved login", "");
                         match api_tracks("liked", "") {
@@ -395,7 +523,7 @@ pub fn run_health_checks(play: bool) {
                             push_check("playback test", 2, play_error_hint_from(&t), "See the playtest lines in the log below");
                         }
                     }
-                    Err(e) => push_check("playback test", 2, format!("could not run test ({e})"), "sudo pacman -S coreutils mpv"),
+                    Err(e) => push_check("playback test", 2, format!("could not run test ({e})"), &crate::distro::install_hint(&[crate::distro::Pkg::Coreutils, crate::distro::Pkg::Mpv])),
                 }
             }
         }
@@ -435,7 +563,7 @@ pub fn run_ytdlp(args: Vec<String>) -> Result<Vec<Track>, String> {
             if dur.map_or(false, |d| d > 1200.0) {
                 return None;
             }
-            Some(Track { id, title, artist, dur })
+            Some(Track { id, title, artist, dur, ..Default::default() })
         })
         .collect();
     if tracks.is_empty() {
@@ -449,96 +577,28 @@ pub fn run_ytdlp(args: Vec<String>) -> Result<Vec<Track>, String> {
     Ok(tracks)
 }
 
-const API_SCRIPT: &str = include_str!("rustym_api.py");
-
-/// Runs the bundled YouTube Music client (src/rustym_api.py) with the saved cookies.
-fn api_call(mode: &str, arg: &str) -> Result<Value, String> {
-    match api_call_once(mode, arg) {
-        // YouTube rejected the saved cookies: re-read the app's own login profile (which holds the
-        // freshest session) and try once more, like limusic's session keep-alive.
-        Err(e) if e.contains("rejected") || e.contains("signed out") => {
-            log(1, "api", format!("session rejected on '{mode}', re-reading the login profile"));
-            match refresh_session() {
-                Ok(()) => api_call_once(mode, arg),
-                Err(why) => {
-                    log(2, "api", format!("could not refresh session: {why}"));
-                    Err(e)
-                }
-            }
-        }
-        r => r,
-    }
-}
-
-fn api_call_once(mode: &str, arg: &str) -> Result<Value, String> {
+/// Liked songs (`mode` = "liked") or a library playlist (`mode` = "playlist", `arg` = id),
+/// fetched straight from the YouTube Music API by the native client in `ytm.rs`.
+pub fn api_tracks(mode: &str, arg: &str) -> Result<Vec<Track>, String> {
     let t0 = Instant::now();
-    let r = api_call_raw(mode, arg);
+    let r = match mode {
+        "liked" => crate::ytm::liked(),
+        _ => crate::ytm::playlist(arg).map(|d| d.tracks),
+    };
     match &r {
-        Ok(_) => log(0, "api", format!("{mode} ok ({:.1}s)", t0.elapsed().as_secs_f32())),
+        Ok(t) => log(0, "api", format!("{mode} ok: {} songs ({:.1}s)", t.len(), t0.elapsed().as_secs_f32())),
         Err(e) => log(2, "api", format!("{mode} failed ({:.1}s): {e}", t0.elapsed().as_secs_f32())),
     }
-    r
-}
-
-fn api_call_raw(mode: &str, arg: &str) -> Result<Value, String> {
-    if !cookie_file().exists() {
-        return Err("Not signed in (no saved cookies). Sign in again.".into());
-    }
-    let o = Command::new("python3")
-        .arg("-c")
-        .arg(API_SCRIPT)
-        .arg(cookie_file())
-        .arg(mode)
-        .arg(arg)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("python3 not available ({e})"))?;
-    let v: Value = serde_json::from_slice(&o.stdout)
-        .map_err(|_| format!("YouTube Music request failed: {}", last_line(&o.stderr)))?;
-    if let Some(e) = v["error"].as_str() {
-        return Err(e.to_string());
-    }
-    Ok(v)
-}
-
-/// Liked songs (`mode` = "liked") or a library playlist (`mode` = "playlist", `arg` = id),
-/// fetched straight from the YouTube Music API.
-pub fn api_tracks(mode: &str, arg: &str) -> Result<Vec<Track>, String> {
-    let v = api_call(mode, arg)?;
-    let t: Vec<Track> = v["tracks"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| {
-                    Some(Track {
-                        id: x["id"].as_str()?.to_string(),
-                        title: x["title"].as_str()?.to_string(),
-                        artist: x["artist"].as_str().unwrap_or("").to_string(),
-                        dur: x["dur"].as_f64(),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    if t.is_empty() {
-        Err("No songs found there.".into())
-    } else {
-        Ok(t)
+    match r {
+        Ok(t) if t.is_empty() => Err("No songs found there.".into()),
+        r => r,
     }
 }
 
 /// The playlists saved in the user's YouTube Music library.
 pub fn api_playlists() -> Result<Vec<RemotePl>, String> {
-    let v = api_call("playlists", "")?;
-    let p: Vec<RemotePl> = v["playlists"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|x| Some(RemotePl { id: x["id"].as_str()?.to_string(), title: x["title"].as_str()?.to_string() }))
-                .collect()
-        })
-        .unwrap_or_default();
+    let cards = crate::ytm::library_playlists()?;
+    let p: Vec<RemotePl> = cards.into_iter().map(|c| RemotePl { id: c.id, title: c.title }).collect();
     if p.is_empty() {
         Err("No playlists found in your YouTube Music library.".into())
     } else {
@@ -592,66 +652,92 @@ pub fn run_playlists(chains: Vec<Vec<String>>) -> Result<Vec<RemotePl>, String> 
     Err(err)
 }
 
-pub fn browser_bin(b: &str) -> &'static str {
-    match b {
-        "firefox" => "firefox",
-        "chromium" => "chromium",
-        "brave" => "brave",
-        "chrome" => "google-chrome-stable",
-        "vivaldi" => "vivaldi",
-        "opera" => "opera",
-        "edge" => "microsoft-edge-stable",
-        _ => "xdg-open",
-    }
-}
+/// The sign-in window (a small helper program installed next to Rustym).
+static HELPER: std::sync::Mutex<Option<std::process::Child>> = std::sync::Mutex::new(None);
 
-/// True once `open_login` started the browser with the app's private login profile.
-static ISOLATED: AtomicBool = AtomicBool::new(false);
-
-/// The browser profile that belongs to rustym alone. Signing in there (instead of reading your
-/// everyday browser) means Google never rotates these cookies behind our back - the same idea as
-/// limusic's dedicated login window.
-pub fn login_profile_dir() -> PathBuf {
-    let d = config_dir().join("login-profile");
-    let _ = std::fs::create_dir_all(&d);
-    d
-}
-
-/// Signs out completely: saved cookies and the private login profile.
+/// Signs out completely: the saved cookies.
 pub fn forget_login() {
     let _ = std::fs::remove_file(cookie_file());
-    let _ = std::fs::remove_dir_all(config_dir().join("login-profile"));
+    let _ = std::fs::remove_file(config_dir().join("cookies.tmp"));
+    close_login_window();
 }
 
-/// Opens the Google sign-in page in the chosen browser, using rustym's private profile.
-pub fn open_login(browser: &str) -> bool {
-    let url = "https://accounts.google.com/ServiceLogin?service=youtube&continue=https%3A%2F%2Fmusic.youtube.com";
-    let prof = login_profile_dir();
-    let mut cmd = Command::new(browser_bin(browser));
-    if browser == "firefox" {
-        cmd.arg("--no-remote").arg("--profile").arg(&prof);
-    } else if browser_bin(browser) != "xdg-open" {
-        cmd.arg(format!("--user-data-dir={}", prof.display()))
-            .arg("--password-store=basic")
-            .arg("--no-first-run")
-            .arg("--no-default-browser-check");
+fn close_login_window() {
+    if let Ok(mut g) = HELPER.lock() {
+        if let Some(mut c) = g.take() {
+            let pid = c.id();
+            let _ = c.kill();
+            let _ = c.wait();
+            // the window's throw-away data folder (see rustym-login)
+            let _ = std::fs::remove_dir_all(std::env::temp_dir().join(format!("rustym-login-{pid}")));
+        }
     }
-    let isolated = cmd
-        .arg(url)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .is_ok();
-    ISOLATED.store(isolated && browser_bin(browser) != "xdg-open", SeqCst);
-    log(
-        if isolated { 0 } else { 2 },
-        "login",
-        format!("opening {browser} for Google sign-in (private profile {}, started={isolated})", prof.display()),
-    );
-    if !isolated {
-        let _ = Command::new("xdg-open").arg(url).spawn();
+}
+
+/// Path of the first executable called `name` on PATH.
+fn which_bin(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).map(|d| d.join(name)).find(|p| p.is_file())
+}
+
+fn login_helper() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let h = exe.parent()?.join("rustym-login");
+    if h.is_file() {
+        return Some(h);
     }
-    isolated
+    which_bin("rustym-login")
+}
+
+/// Opens Rustym's own Google sign-in window. The helper saves the cookies itself and exits.
+pub fn open_login() -> Result<(), String> {
+    let Some(h) = login_helper() else {
+        let m = format!(
+            "The sign-in window (rustym-login) is not installed. Re-run ./install.sh (it needs WebKitGTK 4.1: {}).",
+            crate::distro::install_hint(&[crate::distro::Pkg::Webkit])
+        );
+        log(2, "login", &m);
+        return Err(m);
+    };
+    close_login_window();
+    let tmp = config_dir().join("cookies.tmp");
+    let _ = std::fs::remove_file(&tmp);
+    match Command::new(h).arg(&tmp).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+        Ok(child) => {
+            if let Ok(mut g) = HELPER.lock() {
+                *g = Some(child);
+            }
+            log(0, "login", "opened the Rustym sign-in window");
+            Ok(())
+        }
+        Err(e) => {
+            let m = format!("Could not open the sign-in window: {e}");
+            log(2, "login", &m);
+            Err(m)
+        }
+    }
+}
+
+/// Picks up the cookies the sign-in window saved.
+fn check_login() -> Result<(), String> {
+    let tmp = config_dir().join("cookies.tmp");
+    if has_login_cookies(&tmp) {
+        install_cookies(&tmp);
+        Ok(())
+    } else {
+        Err("not signed in to Google yet".into())
+    }
+}
+
+/// True while the sign-in window is still open.
+fn login_window_open() -> bool {
+    match HELPER.lock() {
+        Ok(mut g) => match g.as_mut() {
+            Some(c) => matches!(c.try_wait(), Ok(None)),
+            None => false,
+        },
+        Err(_) => false,
+    }
 }
 
 /// Where the signed-in cookies are kept (Netscape cookies.txt, readable by yt-dlp).
@@ -665,7 +751,8 @@ pub fn auth_args(c: &Config) -> Vec<String> {
     if cookie_file().exists() {
         vec!["--cookies".into(), cookie_file().to_string_lossy().to_string()]
     } else {
-        vec!["--cookies-from-browser".into(), c.browser.clone()]
+        let _ = c;
+        vec![]
     }
 }
 
@@ -684,96 +771,6 @@ fn private_file(p: &std::path::Path) {
     let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600));
 }
 
-fn browser_dirs(b: &str) -> &'static [&'static str] {
-    match b {
-        "firefox" => &[".mozilla/firefox", ".var/app/org.mozilla.firefox/.mozilla/firefox", "snap/firefox/common/.mozilla/firefox"],
-        "chromium" => &[".config/chromium", ".var/app/org.chromium.Chromium/config/chromium", "snap/chromium/common/chromium"],
-        "brave" => &[".config/BraveSoftware/Brave-Browser", ".var/app/com.brave.Browser/config/BraveSoftware/Brave-Browser"],
-        "chrome" => &[".config/google-chrome", ".var/app/com.google.Chrome/config/google-chrome"],
-        "vivaldi" => &[".config/vivaldi"],
-        "opera" => &[".config/opera"],
-        "edge" => &[".config/microsoft-edge"],
-        _ => &[],
-    }
-}
-
-fn browser_installed(b: &str) -> bool {
-    let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
-    browser_dirs(b).iter().any(|d| home.join(d).exists())
-}
-
-/// The chosen browser first, then every other browser that has a profile on disk.
-/// (You might sign in with a different browser than the one selected in Settings.)
-pub fn candidate_browsers(preferred: &str) -> Vec<String> {
-    let mut v = vec![preferred.to_string()];
-    for b in BROWSERS {
-        if b != preferred && browser_installed(b) {
-            v.push(b.to_string());
-        }
-    }
-    v
-}
-
-/// Reads Firefox's cookie database *including its write-ahead log* (Firefox keeps fresh logins
-/// in the -wal file, which yt-dlp ignores) and writes a Netscape cookies.txt.
-const FF_SCRIPT: &str = r#"
-import os, sys, shutil, sqlite3, tempfile
-out = sys.argv[1]
-dbs = []
-for root in sys.argv[2:]:
-    for dp, dn, fn in os.walk(root):
-        if 'cookies.sqlite' in fn:
-            dbs.append(os.path.join(dp, 'cookies.sqlite'))
-if not dbs:
-    print('no Firefox profile found'); sys.exit(2)
-def stamp(p):
-    t = os.path.getmtime(p)
-    if os.path.exists(p + '-wal'):
-        t = max(t, os.path.getmtime(p + '-wal'))
-    return t
-db = max(dbs, key=stamp)
-tmp = tempfile.mkdtemp()
-try:
-    shutil.copy(db, tmp + '/c.sqlite')
-    if os.path.exists(db + '-wal'):
-        shutil.copy(db + '-wal', tmp + '/c.sqlite-wal')
-    con = sqlite3.connect(tmp + '/c.sqlite')
-    rows = con.execute("select host, path, isSecure, expiry, name, value from moz_cookies "
-                       "where host like '%youtube.com' or host like '%google.com'").fetchall()
-finally:
-    shutil.rmtree(tmp, ignore_errors=True)
-with open(out, 'w') as f:
-    f.write('# Netscape HTTP Cookie File\n')
-    for h, p, sec, exp, n, v in rows:
-        if exp and exp > 10**11:
-            exp //= 1000
-        f.write('%s\t%s\t%s\t%s\t%s\t%s\t%s\n' % (h, 'TRUE' if h.startswith('.') else 'FALSE', p,
-                'TRUE' if sec else 'FALSE', exp or 0, n, v))
-print('ok', len(rows))
-"#;
-
-fn firefox_export(out: &std::path::Path, roots: &[PathBuf]) -> Result<(), String> {
-    let mut cmd = Command::new("python3");
-    cmd.arg("-c").arg(FF_SCRIPT).arg(out);
-    for d in roots {
-        cmd.arg(d);
-    }
-    let o = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| format!("python3 not available ({e})"))?;
-    if o.status.success() {
-        Ok(())
-    } else {
-        let mut m = last_line(&o.stdout);
-        if m == "no details" {
-            m = last_line(&o.stderr);
-        }
-        Err(m)
-    }
-}
-
 /// True if a cookies.txt contains Google's login cookies.
 fn has_login_cookies(p: &std::path::Path) -> bool {
     std::fs::read_to_string(p)
@@ -786,153 +783,14 @@ fn install_cookies(tmp: &std::path::Path) {
     let _ = std::fs::rename(tmp, cookie_file());
 }
 
-/// Looks for a Google login in the browser's cookies. On success the cookies are exported to
-/// `cookie_file()` so they keep working afterwards.
-pub fn check_login(browser: &str) -> Result<(), String> {
-    if ISOLATED.load(SeqCst) {
-        return check_login_isolated(browser);
-    }
-    let tmp = config_dir().join("cookies.tmp");
-    let _ = std::fs::remove_file(&tmp);
-    let mut why = String::new();
-    if browser == "firefox" {
-        let home = PathBuf::from(std::env::var("HOME").unwrap_or_default());
-        let roots: Vec<PathBuf> = browser_dirs("firefox").iter().map(|d| home.join(d)).collect();
-        match firefox_export(&tmp, &roots) {
-            Ok(()) if has_login_cookies(&tmp) => {
-                install_cookies(&tmp);
-                return Ok(());
-            }
-            Ok(()) => why = "Firefox has no Google login yet".to_string(),
-            Err(e) => why = e,
-        }
-        let _ = std::fs::remove_file(&tmp);
-    }
-    // Chromium-based browsers encrypt cookies with a key from the system keyring. yt-dlp has to
-    // guess which keyring, and on Hyprland it often guesses wrong, so try them all.
-    let specs: Vec<String> = if browser == "firefox" {
-        vec![browser.to_string()]
-    } else {
-        ["", "+gnomekeyring", "+kwallet6", "+kwallet5", "+kwallet", "+basictext"]
-            .iter()
-            .map(|k| format!("{browser}{k}"))
-            .collect()
-    };
-    let mut last_err = String::new();
-    for spec in specs {
-        let _ = std::fs::remove_file(&tmp);
-        let out = Command::new("yt-dlp")
-            .args(["--cookies-from-browser", spec.as_str(), "--cookies"])
-            .arg(&tmp)
-            .args([
-                "--flat-playlist",
-                "--dump-json",
-                "--playlist-end",
-                "1",
-                "--socket-timeout",
-                "10",
-                "https://music.youtube.com/playlist?list=LM",
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|e| format!("Could not run yt-dlp ({e}). Is it installed?"))?;
-        if has_login_cookies(&tmp) {
-            install_cookies(&tmp);
-            return Ok(());
-        }
-        // Prefer a line that explains a cookie / keyring problem over the generic final error.
-        let text = String::from_utf8_lossy(&out.stderr).to_string();
-        let hint = text
-            .lines()
-            .rev()
-            .find(|l| {
-                let l = l.to_lowercase();
-                l.contains("decrypt") || l.contains("keyring") || l.contains("wallet") || l.contains("cookie")
-            })
-            .map(|l| l.trim().to_string())
-            .unwrap_or_else(|| last_line(&out.stderr));
-        last_err = format!("{spec}: {hint}");
-    }
-    let _ = std::fs::remove_file(&tmp);
-    Err(if why.is_empty() { last_err } else { format!("{why}; {last_err}") })
-}
-
-/// Reads the login out of rustym's private browser profile (see `open_login`) into `cookie_file()`.
-fn check_login_isolated(browser: &str) -> Result<(), String> {
-    let tmp = config_dir().join("cookies.tmp");
-    let _ = std::fs::remove_file(&tmp);
-    let prof = login_profile_dir();
-    let res: Result<(), String> = if browser == "firefox" {
-        firefox_export(&tmp, &[prof.clone()])
-    } else {
-        // The profile was started with --password-store=basic, so its cookies use Chromium's
-        // fixed "peanuts" key and yt-dlp can read them without any keyring.
-        let spec = format!("{browser}+basictext:{}", prof.display());
-        match Command::new("yt-dlp")
-            .args(["--cookies-from-browser", spec.as_str(), "--cookies"])
-            .arg(&tmp)
-            .args([
-                "--flat-playlist",
-                "--dump-json",
-                "--no-warnings",
-                "--playlist-end",
-                "1",
-                "--socket-timeout",
-                "10",
-                "https://music.youtube.com/playlist?list=LM",
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-        {
-            Ok(o) if tmp.exists() => {
-                let _ = o;
-                Ok(())
-            }
-            Ok(o) => Err(last_line(&o.stderr)),
-            Err(e) => Err(format!("Could not run yt-dlp ({e}). Is it installed?")),
-        }
-    };
-    match res {
-        Ok(()) if has_login_cookies(&tmp) => {
-            install_cookies(&tmp);
-            Ok(())
-        }
-        Ok(()) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err("not signed in to Google yet in the rustym sign-in window".into())
-        }
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
-}
-
-/// Re-reads the private login profile and swaps in the fresh cookies.
-fn refresh_session() -> Result<(), String> {
-    if !login_profile_dir().join("cookies.sqlite").exists() && !has_chromium_profile() {
-        return Err("no login profile".into());
-    }
-    let b = Config::load().browser;
-    ISOLATED.store(true, SeqCst);
-    check_login_isolated(&b)
-}
-
-fn has_chromium_profile() -> bool {
-    let p = login_profile_dir();
-    p.join("Default").exists() || p.join("Local State").exists()
-}
-
 /// Asks YouTube Music itself whether the saved cookies are accepted (a signed-in library comes
 /// back). Without this, "login detected" only meant "cookies exist", which is why sign-in used to
 /// look fine while liked songs and playlists stayed empty.
 pub fn verify_session() -> Result<(), String> {
-    match api_call_once("verify", "") {
-        Ok(_) => Ok(()),
+    match crate::ytm::verify() {
+        Ok(()) => Ok(()),
         // offline: can't tell, don't block the login
-        Err(e) if e.starts_with("network error") || e.contains("python3 not available") => Ok(()),
+        Err(e) if e.starts_with("network error") => Ok(()),
         Err(e) => Err(e),
     }
 }
@@ -964,106 +822,492 @@ pub fn check_cookie_file() -> Result<(), String> {
     }
 }
 
-/// Polls every ~4s for up to ~6 minutes while the user signs in. Returns the browser that worked.
-pub fn wait_for_login(preferred: &str, cancel: &AtomicBool, progress: &dyn Fn(String)) -> Result<String, String> {
+/// Polls every ~2s (up to ~6 minutes) until the sign-in window has saved a working login.
+pub fn wait_for_login(cancel: &AtomicBool, progress: &dyn Fn(String)) -> Result<(), String> {
     let mut last = String::from("no login found yet");
-    for _ in 0..90 {
-        let list = if ISOLATED.load(SeqCst) { vec![preferred.to_string()] } else { candidate_browsers(preferred) };
-        for b in list {
-            if cancel.load(SeqCst) {
-                return Err("Cancelled.".into());
+    for _ in 0..180 {
+        if cancel.load(SeqCst) {
+            close_login_window();
+            return Err("Cancelled.".into());
+        }
+        match check_login().and_then(|_| verify_session()) {
+            Ok(()) => {
+                log(0, "login", "signed in");
+                close_login_window();
+                return Ok(());
             }
-            progress(format!("Checking {b}…"));
-            match check_login(&b).and_then(|_| verify_session()) {
-                Ok(()) => {
-                    log(0, "login", format!("signed in via {b}"));
-                    return Ok(b);
+            Err(e) => {
+                if !login_window_open() && !config_dir().join("cookies.tmp").exists() {
+                    return Err("The sign-in window was closed before signing in.".into());
                 }
-                Err(e) => {
-                    log(1, "login", format!("{b}: {e}"));
-                    progress(format!("Not signed in yet — {e}"));
-                    last = e;
-                }
+                progress("Waiting for you to finish signing in…".into());
+                last = e;
             }
         }
-        for _ in 0..40 {
+        for _ in 0..20 {
             if cancel.load(SeqCst) {
+                close_login_window();
                 return Err("Cancelled.".into());
             }
             std::thread::sleep(Duration::from_millis(100));
         }
     }
+    close_login_window();
     Err(last)
 }
 
 // ---------------- mpv ----------------
 
-pub fn mpv_cmd(cmd: Value) -> Option<Value> {
-    let mut s = UnixStream::connect(SOCK).ok()?;
-    s.set_read_timeout(Some(Duration::from_millis(150))).ok()?;
-    s.set_write_timeout(Some(Duration::from_millis(150))).ok()?;
-    let req = json!({ "command": cmd, "request_id": 7 });
-    writeln!(s, "{req}").ok()?;
-    let mut r = BufReader::new(s);
-    let mut line = String::new();
-    for _ in 0..20 {
-        line.clear();
-        if r.read_line(&mut line).ok()? == 0 {
-            return None;
-        }
-        if let Ok(v) = serde_json::from_str::<Value>(&line) {
-            if v["request_id"] == 7 {
-                return Some(v);
+/// One persistent connection to mpv's JSON IPC socket (no reconnecting for every property read).
+struct Ipc {
+    w: UnixStream,
+    r: BufReader<UnixStream>,
+    id: u64,
+}
+
+impl Ipc {
+    fn connect() -> Option<Ipc> {
+        let w = UnixStream::connect(sock()).ok()?;
+        w.set_write_timeout(Some(Duration::from_millis(500))).ok()?;
+        let rs = w.try_clone().ok()?;
+        rs.set_read_timeout(Some(Duration::from_millis(500))).ok()?;
+        Some(Ipc { w, r: BufReader::new(rs), id: 100 })
+    }
+
+    fn cmd(&mut self, cmd: Value) -> Option<Value> {
+        self.id += 1;
+        let id = self.id;
+        let req = json!({ "command": cmd, "request_id": id });
+        writeln!(self.w, "{req}").ok()?;
+        let mut line = String::new();
+        for _ in 0..300 {
+            line.clear();
+            match self.r.read_line(&mut line) {
+                Ok(0) => return None,
+                Ok(_) => {}
+                Err(_) => return None,
+            }
+            if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                if v["request_id"].as_u64() == Some(id) {
+                    return Some(v);
+                }
             }
         }
+        None
     }
-    None
-}
 
-fn mpv_f64(prop: &str) -> Option<f64> {
-    mpv_cmd(json!(["get_property", prop]))?["data"].as_f64()
-}
+    fn get(&mut self, prop: &str) -> Option<Value> {
+        let v = self.cmd(json!(["get_property", prop]))?;
+        if v["error"] == "success" {
+            Some(v["data"].clone())
+        } else {
+            None
+        }
+    }
 
-fn mpv_bool(prop: &str) -> Option<bool> {
-    mpv_cmd(json!(["get_property", prop]))?["data"].as_bool()
+    fn f64(&mut self, prop: &str) -> Option<f64> {
+        self.get(prop)?.as_f64()
+    }
+
+    fn bool(&mut self, prop: &str) -> Option<bool> {
+        self.get(prop)?.as_bool()
+    }
+
+    fn set(&mut self, prop: &str, val: Value) -> bool {
+        self.cmd(json!(["set_property", prop, val])).map_or(false, |v| v["error"] == "success")
+    }
 }
 
 // ---------------- playback engine (own thread, keeps running when window is hidden) ----------------
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
+pub enum Repeat {
+    #[default]
+    Off,
+    All,
+    One,
+}
+
+pub const EQ_FREQS: [u32; 10] = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+pub const REVERBS: [&str; 4] = ["Off", "Small room", "Large hall", "Cathedral"];
+
+/// Tempo, pitch, equaliser, reverb and loudness normalisation (all done by mpv / ffmpeg filters).
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct Fx {
+    pub speed: f32,
+    /// semitones, -12 ..= +12
+    pub pitch: f32,
+    pub eq_on: bool,
+    pub eq: [f32; 10],
+    pub reverb: u8,
+    pub normalize: bool,
+    /// 8D audio: the sound slowly circles around your head (left <-> right auto-pan).
+    pub eight_d: bool,
+    /// How fast the 8D sound circles, in cycles per second (0.05 ..= 0.5).
+    pub eight_d_hz: f32,
+}
+
+impl Default for Fx {
+    fn default() -> Self {
+        Fx { speed: 1.0, pitch: 0.0, eq_on: false, eq: [0.0; 10], reverb: 0, normalize: false, eight_d: false, eight_d_hz: 0.125 }
+    }
+}
+
+/// Equaliser curve used by the player-bar "Bass" button.
+pub const BASS_EQ: [f32; 10] = [6.0, 5.0, 4.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+
+impl Fx {
+    fn af(&self) -> String {
+        let mut f: Vec<String> = vec![];
+        if self.eq_on {
+            for (i, g) in self.eq.iter().enumerate() {
+                if g.abs() > 0.05 {
+                    f.push(format!("equalizer=f={}:t=o:w=1:g={:.1}", EQ_FREQS[i], g));
+                }
+            }
+        }
+        if self.pitch.abs() > 0.01 {
+            f.push(format!("rubberband=pitch={:.5}", 2f32.powf(self.pitch / 12.0)));
+        }
+        match self.reverb {
+            1 => f.push("aecho=0.8:0.88:40|60:0.3|0.2".to_string()),
+            2 => f.push("aecho=0.8:0.9:60|120|180:0.4|0.3|0.2".to_string()),
+            3 => f.push("aecho=0.8:0.88:250|500|750:0.35|0.25|0.15".to_string()),
+            _ => {}
+        }
+        if self.eight_d {
+            // a little room echo makes the circling feel like it is outside the headphones
+            if self.reverb == 0 {
+                f.push("aecho=0.8:0.85:70|130:0.25|0.15".to_string());
+            }
+            f.push(format!("apulsator=mode=sine:hz={:.3}:amount=1:offset_l=0:offset_r=0.5", self.eight_d_hz.clamp(0.02, 1.0)));
+        }
+        if self.normalize {
+            f.push("loudnorm=I=-14:TP=-1.5:LRA=11".to_string());
+        }
+        if f.is_empty() {
+            String::new()
+        } else {
+            format!("lavfi=[{}]", f.join(","))
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
 pub enum Cmd {
+    /// Replace the queue and start playing item `usize`.
     Play(Vec<Track>, usize),
     Toggle,
     Next,
     Prev,
     Seek(f64),
+    SeekBy(f64),
     Volume(f32),
+    /// Play queue item N now.
+    Jump(usize),
+    Enqueue(Vec<Track>),
+    PlayNext(Vec<Track>),
+    RemoveAt(usize),
+    MoveItem(usize, usize),
+    ClearUpcoming,
+    Shuffle(bool),
+    SetRepeat(Repeat),
+    Autoplay(bool),
+    RadioResult(Vec<Track>),
+    SetFx(Fx),
+    /// Pause after N minutes (None cancels).
+    Sleep(Option<u64>),
+    SleepEndOfTrack(bool),
     Quit,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Shared {
     pub current: Option<Track>,
     pub pos: f64,
     pub dur: f64,
     pub paused: bool,
     pub playing: bool,
+    /// True while mpv is still resolving / buffering the current song.
+    pub loading: bool,
     pub error: String,
+    /// Cheap to clone every frame; replaced only when the queue changes. Not part of the periodic
+    /// state message: the window process fetches it separately when `queue_ver` changes.
+    #[serde(skip)]
+    pub queue: Arc<Vec<Track>>,
+    pub idx: usize,
+    pub queue_ver: u64,
+    pub shuffle: bool,
+    pub repeat: Repeat,
+    pub autoplay: bool,
+    pub sleep_left: Option<u64>,
+    pub sleep_eot: bool,
+}
+
+fn track_url(t: &Track) -> String {
+    if t.local.is_empty() {
+        format!("https://music.youtube.com/watch?v={}", t.id)
+    } else {
+        t.local.clone()
+    }
+}
+
+/// How many upcoming songs get their stream URL resolved ahead of time.
+const PREFETCH_AHEAD: usize = 6;
+/// Resolved stream URLs expire on YouTube's side after a few hours; stay well below that.
+const STREAM_TTL: Duration = Duration::from_secs(4 * 3600);
+
+/// Direct audio URLs resolved in the background, so the next songs start without waiting for yt-dlp.
+#[derive(Default)]
+struct StreamCache {
+    urls: HashMap<String, (String, Instant)>,
+    /// Ids being resolved right now (so the same song is never resolved twice at once).
+    busy: HashSet<String>,
+}
+
+/// Asks yt-dlp for the direct audio URL of a song.
+fn resolve_stream(id: &str) -> Option<String> {
+    let url = format!("https://music.youtube.com/watch?v={id}");
+    let out = Command::new("yt-dlp")
+        .args(["--quiet", "--no-warnings", "--no-playlist", "--socket-timeout", "15", "--format", YTDL_FORMAT, "--get-url"])
+        .arg(url.as_str())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let first = String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or("").trim().to_string();
+    if first.starts_with("http") {
+        Some(first)
+    } else {
+        None
+    }
 }
 
 struct Engine {
     queue: Vec<Track>,
+    /// Original order while shuffle is on.
+    orig: Option<Vec<Track>>,
     idx: usize,
     child: Option<Child>,
+    ipc: Option<Ipc>,
     started: Instant,
+    got_pos: bool,
+    /// Queue index already handed to mpv for gapless playback.
+    appended: Option<usize>,
     volume: f32,
+    fx: Fx,
+    repeat: Repeat,
+    shuffle: bool,
+    autoplay: bool,
+    waiting_radio: bool,
+    fetching: bool,
+    sleep_at: Option<Instant>,
+    sleep_eot: bool,
+    fail_streak: u32,
+    listen: f64,
+    counted: bool,
+    last_tick: Instant,
     shared: Arc<Mutex<Shared>>,
+    tx: Sender<Cmd>,
+    streams: Arc<Mutex<StreamCache>>,
+    /// The song now playing was started from a prefetched URL (so a failure can retry the normal way).
+    warm: bool,
+    /// Same, for the song handed to mpv for gapless playback.
+    appended_warm: bool,
+    last_prefetch: Instant,
 }
 
 impl Engine {
+    /// Takes the prefetched URL for a song, if there is a fresh one.
+    fn take_warm(&self, t: &Track) -> Option<String> {
+        if !t.local.is_empty() {
+            return None;
+        }
+        let mut c = self.streams.lock().unwrap_or_else(|p| p.into_inner());
+        match c.urls.remove(&t.id) {
+            Some((u, at)) if at.elapsed() < STREAM_TTL => Some(u),
+            _ => None,
+        }
+    }
+
+    /// Resolves the stream URLs of the next `PREFETCH_AHEAD` songs in the background.
+    /// Songs that are already resolved (or being resolved) are skipped, so calling this often is cheap.
+    fn prefetch(&self, start: usize) {
+        for t in self.queue.iter().skip(start).take(PREFETCH_AHEAD) {
+            if !t.local.is_empty() || t.id.is_empty() {
+                continue;
+            }
+            {
+                let mut c = self.streams.lock().unwrap_or_else(|p| p.into_inner());
+                let fresh = c.urls.get(&t.id).map_or(false, |(_, at)| at.elapsed() < STREAM_TTL);
+                if fresh || c.busy.contains(&t.id) {
+                    continue;
+                }
+                c.busy.insert(t.id.clone());
+            }
+            let streams = self.streams.clone();
+            let id = t.id.clone();
+            std::thread::spawn(move || {
+                let r = resolve_stream(&id);
+                let mut c = streams.lock().unwrap_or_else(|p| p.into_inner());
+                c.busy.remove(&id);
+                match r {
+                    Some(u) => {
+                        c.urls.insert(id, (u, Instant::now()));
+                        if c.urls.len() > 64 {
+                            c.urls.retain(|_, v| v.1.elapsed() < STREAM_TTL);
+                        }
+                    }
+                    None => log(1, "prefetch", format!("could not resolve a stream for {id} ahead of time")),
+                }
+            });
+        }
+    }
+
     fn kill(&mut self) {
+        self.ipc = None;
         if let Some(mut c) = self.child.take() {
             let _ = c.kill();
             let _ = c.wait();
+        }
+    }
+
+    fn set_error(&self, msg: String) {
+        let mut s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
+        s.error = msg;
+    }
+
+    /// Starts mpv once and keeps it; every song is just a `loadfile` on this process.
+    fn ensure_mpv(&mut self) -> bool {
+        if let Some(c) = self.child.as_mut() {
+            if matches!(c.try_wait(), Ok(None)) && self.ipc.is_some() {
+                return true;
+            }
+        }
+        self.kill();
+        let _ = std::fs::remove_file(sock());
+        let log_path = config_dir().join("mpv.log");
+        if std::fs::metadata(&log_path).map(|m| m.len() > 300_000).unwrap_or(false) {
+            let _ = std::fs::remove_file(&log_path);
+        }
+        let errf = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .map(Stdio::from)
+            .unwrap_or_else(|_| Stdio::null());
+        let mut cmd = Command::new("mpv");
+        for a in [
+            "--no-video",
+            "--force-window=no",
+            "--idle=yes",
+            "--audio-display=no",
+            "--gapless-audio=yes",
+            "--prefetch-playlist=yes",
+            "--keep-open=no",
+            "--audio-client-name=Rustym",
+            "--msg-level=all=error,ytdl_hook=info",
+        ] {
+            cmd.arg(a);
+        }
+        cmd.arg(format!("--ytdl-format={YTDL_FORMAT}"))
+            .arg(format!("--input-ipc-server={}", sock()))
+            .arg(format!("--volume={}", self.volume as i32))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(errf);
+        match cmd.spawn() {
+            Ok(c) => {
+                self.child = Some(c);
+                for _ in 0..80 {
+                    if let Some(ipc) = Ipc::connect() {
+                        self.ipc = Some(ipc);
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                if self.ipc.is_none() {
+                    log(2, "mpv", format!("mpv started but its control socket never appeared. {}", mpv_log_tail(10)));
+                    self.set_error("mpv started but did not answer. Check the Debug logs page.".into());
+                    self.kill();
+                    return false;
+                }
+                log(0, "mpv", "persistent mpv started");
+                self.apply_fx();
+                self.apply_repeat();
+                true
+            }
+            Err(e) => {
+                log(2, "mpv", format!("could not start mpv: {e}"));
+                self.set_error(format!("Could not start mpv ({e}). Is it installed?"));
+                false
+            }
+        }
+    }
+
+    fn apply_fx(&mut self) {
+        let af = self.fx.af();
+        let speed = self.fx.speed.clamp(0.25, 3.0) as f64;
+        let mut failed = false;
+        if let Some(ipc) = self.ipc.as_mut() {
+            ipc.set("speed", json!(speed));
+            let ok = ipc.set("af", json!(af.clone()));
+            if !ok && !af.is_empty() {
+                log(2, "fx", format!("mpv rejected the audio filter chain: {af}"));
+                ipc.set("af", json!(""));
+                failed = true;
+            }
+        }
+        if failed {
+            self.set_error("Audio effects failed (pitch shifting needs ffmpeg built with rubberband).".into());
+        }
+    }
+
+    fn apply_repeat(&mut self) {
+        let one = self.repeat == Repeat::One;
+        if let Some(ipc) = self.ipc.as_mut() {
+            ipc.set("loop-file", json!(if one { "inf" } else { "no" }));
+        }
+    }
+
+    fn load(&mut self, url: &str, mode: &str) -> bool {
+        match self.ipc.as_mut() {
+            Some(ipc) => ipc.cmd(json!(["loadfile", url, mode])).map_or(false, |v| v["error"] == "success"),
+            None => false,
+        }
+    }
+
+    fn flush_listen(&mut self) {
+        let cur = self.shared.lock().unwrap_or_else(|p| p.into_inner()).current.clone();
+        if let Some(t) = cur {
+            if self.listen >= 1.0 {
+                crate::store::add_secs(&t, self.listen);
+            }
+        }
+        self.listen = 0.0;
+    }
+
+    fn publish_queue(&mut self) {
+        let mut s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
+        s.queue = Arc::new(self.queue.clone());
+        s.idx = self.idx;
+        s.queue_ver += 1;
+        s.shuffle = self.shuffle;
+        s.repeat = self.repeat;
+        s.autoplay = self.autoplay;
+        s.sleep_eot = self.sleep_eot;
+    }
+
+    fn invalidate_prefetch(&mut self) {
+        if self.appended.take().is_some() {
+            if let Some(ipc) = self.ipc.as_mut() {
+                ipc.cmd(json!(["playlist-clear"]));
+            }
         }
     }
 
@@ -1071,115 +1315,492 @@ impl Engine {
         if i >= self.queue.len() {
             return;
         }
-        self.kill();
-        let _ = std::fs::remove_file(SOCK);
+        self.flush_listen();
         let t = self.queue[i].clone();
-        // mpv's own messages (mostly yt-dlp's reason when a track won't play) go to a log so
-        // failures can be explained instead of silently doing nothing.
-        let mpv_log_path = config_dir().join("mpv.log");
-        let errf = std::fs::File::create(&mpv_log_path).map(Stdio::from).unwrap_or_else(|_| Stdio::null());
-        let res = Command::new("mpv")
-            .arg("--no-video")
-            .arg("--force-window=no")
-            .arg("--msg-level=all=error,ytdl_hook=info")
-            .arg(format!("--ytdl-format={YTDL_FORMAT}"))
-            .arg(format!("--input-ipc-server={SOCK}"))
-            .arg(format!("--volume={}", self.volume as i32))
-            .arg(format!("https://music.youtube.com/watch?v={}", t.id))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(errf)
-            .spawn();
-        let mut s = self.shared.lock().unwrap();
-        match res {
-            Ok(c) => {
-                log(0, "mpv", format!("started: {} - {} (id {})", t.artist, t.title, t.id));
-                self.child = Some(c);
-                self.idx = i;
-                self.started = Instant::now();
-                s.current = Some(t.clone());
-                s.pos = 0.0;
-                s.dur = t.dur.unwrap_or(0.0);
-                s.paused = false;
-                s.playing = true;
-                s.error.clear();
+        // A prefetched URL starts at once; otherwise mpv resolves the song itself through yt-dlp.
+        let (url, warm) = match self.take_warm(&t) {
+            Some(u) => (u, true),
+            None => (track_url(&t), false),
+        };
+        let mut ok = self.ensure_mpv() && self.load(&url, "replace");
+        if !ok {
+            // mpv may have died in the meantime: restart it once
+            self.kill();
+            ok = self.ensure_mpv() && self.load(&url, "replace");
+        }
+        if !ok {
+            self.idx = i;
+            self.fail_streak = self.fail_streak.saturating_add(1);
+            let hint = play_error_hint();
+            log(2, "mpv", format!(
+                "could not start '{}': {hint}; skipping to the next queue item", t.title
+            ));
+            self.set_error(if hint.is_empty() { "Could not start this track.".into() } else { hint });
+            // A queue containing only unplayable entries must not loop forever, even
+            // when Repeat All is enabled. A successful track resets fail_streak below.
+            if self.fail_streak < self.queue.len().max(1) as u32 && self.next_index(false).is_some() {
+                self.advance(false);
+            } else {
+                self.stop();
             }
-            Err(e) => {
-                log(2, "mpv", format!("could not start mpv: {e}"));
-                s.error = format!("Could not start mpv ({e}). Is it installed?");
+            return;
+        }
+        if let Some(ipc) = self.ipc.as_mut() {
+            ipc.set("pause", json!(false));
+        }
+        log(0, "mpv", format!("play: {} - {} (id {}){}", t.artist, t.title, t.id, if warm { " [prefetched]" } else { "" }));
+        self.warm = warm;
+        self.idx = i;
+        self.started = Instant::now();
+        self.got_pos = false;
+        self.appended = None;
+        self.listen = 0.0;
+        self.counted = false;
+        self.last_tick = Instant::now();
+        {
+            let mut s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
+            s.dur = t.dur.unwrap_or(0.0);
+            s.current = Some(t);
+            s.pos = 0.0;
+            s.paused = false;
+            s.playing = true;
+            s.loading = true;
+            s.error.clear();
+            s.idx = i;
+        }
+        self.last_prefetch = Instant::now();
+        self.prefetch(i + 1);
+    }
+
+    fn stop(&mut self) {
+        self.flush_listen();
+        self.appended = None;
+        self.waiting_radio = false;
+        if let Some(ipc) = self.ipc.as_mut() {
+            ipc.cmd(json!(["stop"]));
+        }
+        let mut s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
+        s.playing = false;
+        s.paused = false;
+        s.loading = false;
+        s.pos = 0.0;
+    }
+
+    fn next_index(&self, auto: bool) -> Option<usize> {
+        let n = self.queue.len();
+        if n == 0 {
+            return None;
+        }
+        if self.repeat == Repeat::One && auto {
+            return Some(self.idx);
+        }
+        if self.idx + 1 < n {
+            Some(self.idx + 1)
+        } else if self.repeat == Repeat::All {
+            Some(0)
+        } else {
+            None
+        }
+    }
+
+    fn advance(&mut self, auto: bool) {
+        if auto && self.sleep_eot {
+            self.sleep_eot = false;
+            log(0, "sleep", "sleep timer: stopping at the end of the song");
+            self.stop();
+            self.publish_queue();
+            return;
+        }
+        match self.next_index(auto) {
+            Some(n) => self.play(n),
+            None => {
+                let can_radio = self.autoplay && self.queue.get(self.idx).map_or(false, |t| t.local.is_empty());
+                if can_radio {
+                    self.waiting_radio = true;
+                    self.fetch_radio();
+                } else {
+                    self.stop();
+                }
             }
         }
     }
 
-    fn next(&mut self) {
-        if self.idx + 1 < self.queue.len() {
-            self.play(self.idx + 1);
-        } else {
-            self.kill();
-            let mut s = self.shared.lock().unwrap();
-            s.playing = false;
-            s.pos = 0.0;
+    fn fetch_radio(&mut self) {
+        if self.fetching {
+            return;
         }
+        let Some(seed) = self.queue.get(self.idx).cloned() else { return };
+        if !seed.local.is_empty() {
+            return;
+        }
+        self.fetching = true;
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let r = crate::ytm::radio(&seed.id).unwrap_or_else(|e| {
+                log(1, "radio", format!("no radio for {}: {e}", seed.id));
+                vec![]
+            });
+            let _ = tx.send(Cmd::RadioResult(r));
+        });
     }
 
     fn prev(&mut self) {
-        let pos = self.shared.lock().unwrap().pos;
+        let pos = self.shared.lock().unwrap_or_else(|p| p.into_inner()).pos;
         if pos > 4.0 || self.idx == 0 {
-            self.play(self.idx);
+            let i = self.idx;
+            self.play(i);
         } else {
-            self.play(self.idx - 1);
+            let i = self.idx - 1;
+            self.play(i);
         }
     }
 
     fn toggle(&mut self) {
-        if self.child.is_some() {
-            let _ = mpv_cmd(json!(["cycle", "pause"]));
-            let mut s = self.shared.lock().unwrap();
-            s.paused = !s.paused;
+        let (playing, paused) = {
+            let s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
+            (s.playing, s.paused)
+        };
+        if playing && self.ipc.is_some() {
+            if let Some(ipc) = self.ipc.as_mut() {
+                ipc.set("pause", json!(!paused));
+            }
+            self.shared.lock().unwrap_or_else(|p| p.into_inner()).paused = !paused;
         } else if !self.queue.is_empty() {
-            self.play(self.idx);
+            let i = self.idx.min(self.queue.len() - 1);
+            self.play(i);
         }
     }
 
-    fn tick(&mut self) {
-        let mut ended = false;
-        let mut code = String::new();
-        if let Some(c) = self.child.as_mut() {
-            if let Ok(Some(st)) = c.try_wait() {
-                ended = true;
-                code = format!("{st}");
+    fn set_queue(&mut self, q: Vec<Track>, i: usize) {
+        if q.is_empty() {
+            return;
+        }
+        let i = i.min(q.len() - 1);
+        self.orig = None;
+        self.waiting_radio = false;
+        if self.shuffle {
+            let chosen = q[i].clone();
+            let mut rest: Vec<Track> = q.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, t)| t.clone()).collect();
+            rest.shuffle(&mut rand::thread_rng());
+            self.orig = Some(q);
+            let mut nq = vec![chosen];
+            nq.extend(rest);
+            self.queue = nq;
+            self.idx = 0;
+        } else {
+            self.queue = q;
+            self.idx = i;
+        }
+        let start = self.idx;
+        self.play(start);
+        self.publish_queue();
+    }
+
+    fn set_shuffle(&mut self, on: bool) {
+        if on == self.shuffle {
+            return;
+        }
+        self.shuffle = on;
+        self.invalidate_prefetch();
+        if on {
+            self.orig = Some(self.queue.clone());
+            let start = (self.idx + 1).min(self.queue.len());
+            self.queue[start..].shuffle(&mut rand::thread_rng());
+        } else if let Some(orig) = self.orig.take() {
+            let cur_id = self.queue.get(self.idx).map(|t| t.id.clone());
+            let mut q = orig;
+            for t in self.queue.iter() {
+                if !q.iter().any(|x| x.id == t.id) {
+                    q.push(t.clone());
+                }
+            }
+            self.idx = cur_id.and_then(|id| q.iter().position(|t| t.id == id)).unwrap_or(0);
+            self.queue = q;
+        }
+        self.publish_queue();
+    }
+
+    fn enqueue(&mut self, tracks: Vec<Track>) {
+        if tracks.is_empty() {
+            return;
+        }
+        if self.queue.is_empty() {
+            self.set_queue(tracks, 0);
+            return;
+        }
+        self.invalidate_prefetch();
+        if let Some(o) = self.orig.as_mut() {
+            o.extend(tracks.clone());
+        }
+        self.queue.extend(tracks);
+        self.publish_queue();
+    }
+
+    fn play_next(&mut self, tracks: Vec<Track>) {
+        if tracks.is_empty() {
+            return;
+        }
+        if self.queue.is_empty() {
+            self.set_queue(tracks, 0);
+            return;
+        }
+        self.invalidate_prefetch();
+        let at = (self.idx + 1).min(self.queue.len());
+        if let Some(o) = self.orig.as_mut() {
+            o.extend(tracks.clone());
+        }
+        for (k, t) in tracks.into_iter().enumerate() {
+            self.queue.insert(at + k, t);
+        }
+        self.publish_queue();
+    }
+
+    fn remove_at(&mut self, i: usize) {
+        if i >= self.queue.len() {
+            return;
+        }
+        self.invalidate_prefetch();
+        let gone = self.queue.remove(i);
+        if let Some(o) = self.orig.as_mut() {
+            if let Some(p) = o.iter().position(|t| t.id == gone.id) {
+                o.remove(p);
             }
         }
-        if ended {
-            self.child = None;
-            if self.started.elapsed() < Duration::from_secs(4) {
-                let hint = play_error_hint();
-                log(
-                    2,
-                    "mpv",
-                    format!("exited after {:.1}s ({code}). {hint}\n--- mpv output ---\n{}", self.started.elapsed().as_secs_f32(), mpv_log_tail(25)),
-                );
-                let mut s = self.shared.lock().unwrap();
-                s.playing = false;
-                s.error = hint;
+        let playing = self.shared.lock().unwrap_or_else(|p| p.into_inner()).playing;
+        if i < self.idx {
+            self.idx -= 1;
+        } else if i == self.idx && playing {
+            // the next song slides into this slot
+            if self.idx < self.queue.len() {
+                let k = self.idx;
+                self.play(k);
             } else {
-                self.next();
+                self.idx = self.queue.len().saturating_sub(1);
+                self.stop();
+            }
+        }
+        self.publish_queue();
+    }
+
+    fn move_item(&mut self, from: usize, to: usize) {
+        let n = self.queue.len();
+        if from >= n || to >= n || from == to {
+            return;
+        }
+        self.invalidate_prefetch();
+        let t = self.queue.remove(from);
+        self.queue.insert(to, t);
+        if from == self.idx {
+            self.idx = to;
+        } else if from < self.idx && to >= self.idx {
+            self.idx -= 1;
+        } else if from > self.idx && to <= self.idx {
+            self.idx += 1;
+        }
+        self.publish_queue();
+    }
+
+    fn clear_upcoming(&mut self) {
+        self.invalidate_prefetch();
+        self.queue.truncate((self.idx + 1).min(self.queue.len()));
+        if let Some(o) = self.orig.as_mut() {
+            let keep: Vec<String> = self.queue.iter().map(|t| t.id.clone()).collect();
+            o.retain(|t| keep.contains(&t.id));
+        }
+        self.publish_queue();
+    }
+
+    fn tick(&mut self) {
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_tick).as_secs_f64().min(1.0);
+        self.last_tick = now;
+
+        // sleep timer
+        if let Some(at) = self.sleep_at {
+            if now >= at {
+                self.sleep_at = None;
+                if let Some(ipc) = self.ipc.as_mut() {
+                    ipc.set("pause", json!(true));
+                }
+                log(0, "sleep", "sleep timer: paused");
+                let mut s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
+                s.paused = true;
+                s.sleep_left = None;
+            } else {
+                let left = at.saturating_duration_since(now).as_secs();
+                self.shared.lock().unwrap_or_else(|p| p.into_inner()).sleep_left = Some(left);
+            }
+        }
+
+        // mpv died?
+        let dead = match self.child.as_mut() {
+            Some(c) => matches!(c.try_wait(), Ok(Some(_))),
+            None => false,
+        };
+        if dead {
+            self.child = None;
+            self.ipc = None;
+            self.appended = None;
+            let playing = self.shared.lock().unwrap_or_else(|p| p.into_inner()).playing;
+            if playing {
+                let hint = play_error_hint();
+                log(2, "mpv", format!("mpv exited unexpectedly. {hint}\n--- mpv output ---\n{}", mpv_log_tail(25)));
+                let mut s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
+                s.playing = false;
+                s.loading = false;
+                s.error = hint;
             }
             return;
         }
-        if self.child.is_some() {
-            let p = mpv_f64("time-pos");
-            let d = mpv_f64("duration");
-            let b = mpv_bool("pause");
-            let mut s = self.shared.lock().unwrap();
-            if let Some(p) = p {
+        if self.ipc.is_none() {
+            return;
+        }
+        let playing = self.shared.lock().unwrap_or_else(|p| p.into_inner()).playing;
+        if !playing {
+            return;
+        }
+        let (pos, dur, paused, idle, plpos) = match self.ipc.as_mut() {
+            Some(ipc) => (
+                ipc.f64("time-pos"),
+                ipc.f64("duration"),
+                ipc.bool("pause"),
+                ipc.bool("idle-active").unwrap_or(false),
+                ipc.get("playlist-pos").and_then(|v| v.as_i64()),
+            ),
+            None => return,
+        };
+
+        // gapless hand-over: mpv moved on to the entry we appended
+        if let (Some(n), Some(1)) = (self.appended, plpos) {
+            self.flush_listen();
+            self.appended = None;
+            if let Some(ipc) = self.ipc.as_mut() {
+                ipc.cmd(json!(["playlist-remove", 0]));
+            }
+            if let Some(t) = self.queue.get(n).cloned() {
+                self.idx = n;
+                self.counted = false;
+                self.got_pos = true;
+                self.warm = self.appended_warm;
+                self.started = Instant::now();
+                self.fail_streak = 0;
+                self.last_prefetch = Instant::now();
+                self.prefetch(n + 1);
+                let mut s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
+                s.dur = dur.or(t.dur).unwrap_or(0.0);
+                s.current = Some(t);
+                s.idx = n;
+                s.pos = pos.unwrap_or(0.0);
+                s.loading = false;
+            }
+            return;
+        }
+
+        if pos.is_some() {
+            if !self.got_pos {
+                // Reaching a real playback position confirms this queue item is playable.
+                self.fail_streak = 0;
+            }
+            self.got_pos = true;
+        }
+        {
+            let mut s = self.shared.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(p) = pos {
                 s.pos = p;
             }
-            if let Some(d) = d {
+            if let Some(d) = dur {
                 s.dur = d;
             }
-            if let Some(b) = b {
+            if let Some(b) = paused {
                 s.paused = b;
+            }
+            s.loading = !self.got_pos;
+        }
+
+        // listening time + "counted as a play" after 30 s (or half of a short song)
+        if self.got_pos && paused == Some(false) {
+            self.listen += dt;
+        }
+        if !self.counted && self.listen >= 5.0 {
+            let d = dur.unwrap_or(0.0);
+            let need = if d > 0.0 { (d * 0.5).min(30.0).max(5.0) } else { 30.0 };
+            if self.listen >= need {
+                self.counted = true;
+                let cur = self.shared.lock().unwrap_or_else(|p| p.into_inner()).current.clone();
+                if let Some(t) = cur {
+                    crate::store::count_play(&t);
+                }
+            }
+        }
+
+        // song finished (or failed to load)
+        if idle && !self.waiting_radio && self.started.elapsed() > Duration::from_millis(1500) {
+            if self.got_pos {
+                self.fail_streak = 0;
+                self.advance(true);
+            } else if self.warm {
+                // The prefetched URL did not work (expired, or YouTube refused it): drop it and
+                // let mpv resolve the song itself, exactly as if nothing had been prefetched.
+                self.warm = false;
+                let title = self.queue.get(self.idx).map(|t| t.title.clone()).unwrap_or_default();
+                log(1, "mpv", format!("prefetched stream for '{title}' failed; retrying with a fresh lookup"));
+                let i = self.idx;
+                self.play(i);
+            } else {
+                self.fail_streak += 1;
+                let hint = play_error_hint();
+                let title = self.queue.get(self.idx).map(|t| t.title.clone()).unwrap_or_default();
+                log(2, "mpv", format!("could not play '{title}': {hint}\n--- mpv output ---\n{}", mpv_log_tail(25)));
+                self.set_error(hint);
+                let can_skip = self.next_index(false).is_some();
+                // Keep trying subsequent queue items until one plays or every item has
+                // failed once. This also prevents an all-broken Repeat All queue looping.
+                if self.fail_streak < self.queue.len().max(1) as u32 && can_skip {
+                    self.advance(false);
+                } else {
+                    self.stop();
+                }
+            }
+            return;
+        }
+
+        // keep the queue going with YouTube Music radio
+        let left = self.queue.len().saturating_sub(self.idx + 1);
+        if self.autoplay
+            && !self.fetching
+            && !self.waiting_radio
+            && self.got_pos
+            && self.repeat == Repeat::Off
+            && left <= 1
+            && self.queue.get(self.idx).map_or(false, |t| t.local.is_empty())
+        {
+            self.fetch_radio();
+        }
+
+        // keep the next songs' stream URLs warm (also picks up queue edits and radio additions)
+        if self.got_pos && self.last_prefetch.elapsed() > Duration::from_secs(5) {
+            self.last_prefetch = Instant::now();
+            let from = self.idx + 1;
+            self.prefetch(from);
+        }
+
+        // gapless: hand the next song to mpv shortly before this one ends
+        if self.appended.is_none() && self.got_pos && !self.sleep_eot && self.repeat != Repeat::One {
+            if let (Some(p), Some(d)) = (pos, dur) {
+                if d > 0.0 && d - p < 20.0 {
+                    if let Some(n) = self.next_index(false) {
+                        if let Some(t) = self.queue.get(n).cloned() {
+                            let (url, warm) = match self.take_warm(&t) {
+                                Some(u) => (u, true),
+                                None => (track_url(&t), false),
+                            };
+                            if self.load(&url, "append") {
+                                self.appended = Some(n);
+                                self.appended_warm = warm;
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1187,7 +1808,7 @@ impl Engine {
 
 /// Turns the tail of mpv.log into a message that says what actually went wrong.
 fn play_error_hint() -> String {
-    let txt = std::fs::read_to_string(config_dir().join("mpv.log")).unwrap_or_default();
+    let txt = mpv_log_tail(40);
     play_error_hint_from(&txt)
 }
 
@@ -1200,20 +1821,25 @@ fn play_error_hint_from(txt: &str) -> String {
         .unwrap_or("")
         .trim()
         .to_string();
-    let hint = if low.contains("error while loading shared libraries") {
-        "mpv is broken by a partial system upgrade: run sudo pacman -Syu (then reinstall mpv if needed)"
+    let hint_owned: String;
+    let hint: &str = if low.contains("error while loading shared libraries") {
+        hint_owned = format!("mpv is out of sync with its libraries: run {} (then reinstall mpv if needed)", crate::distro::upgrade_hint());
+        &hint_owned
     } else if low.contains("javascript runtime") || low.contains("n challenge") || low.contains("ejs") || low.contains("signature solving") {
-        "yt-dlp needs a JavaScript runtime: sudo pacman -S deno yt-dlp-ejs"
+        hint_owned = format!("yt-dlp needs a JavaScript runtime (deno): {}", install_deno());
+        &hint_owned
     } else if low.contains("confirm you") && low.contains("bot") {
         "YouTube wants a bot check: sign in again in Settings, or update yt-dlp"
     } else if low.contains("requested format is not available") {
-        "No audio format came back: update yt-dlp (sudo pacman -Syu yt-dlp) and install deno yt-dlp-ejs"
+        hint_owned = format!("No audio format came back: update yt-dlp (yt-dlp -U, or {}) and install deno", crate::distro::upgrade_hint());
+        &hint_owned
     } else if low.contains("unable to download") || low.contains("name or service not known") {
         "Network problem reaching YouTube"
     } else if low.contains("ytdl_hook") && low.contains("not found") || low.contains("youtube-dl") && low.contains("not found") {
-        "mpv can't find yt-dlp: sudo pacman -S yt-dlp"
+        hint_owned = format!("mpv can't find yt-dlp: {}", install_ytdlp());
+        &hint_owned
     } else {
-        "Couldn’t play that track. Update yt-dlp and install deno yt-dlp-ejs"
+        "Couldn’t play that track. Update yt-dlp (yt-dlp -U) and install deno"
     };
     if last.is_empty() {
         hint.to_string()
@@ -1225,47 +1851,152 @@ fn play_error_hint_from(txt: &str) -> String {
 
 pub fn spawn_engine(volume: f32, repaint: Repaint) -> (Sender<Cmd>, Arc<Mutex<Shared>>) {
     let (tx, rx) = channel::<Cmd>();
-    let shared = Arc::new(Mutex::new(Shared::default()));
+    let shared = Arc::new(Mutex::new(Shared { autoplay: true, ..Default::default() }));
     let sh = shared.clone();
+    let tx2 = tx.clone();
     std::thread::spawn(move || {
         let mut e = Engine {
             queue: vec![],
+            orig: None,
             idx: 0,
             child: None,
+            ipc: None,
             started: Instant::now(),
+            got_pos: false,
+            appended: None,
             volume,
+            fx: Fx::default(),
+            repeat: Repeat::Off,
+            shuffle: false,
+            autoplay: true,
+            waiting_radio: false,
+            fetching: false,
+            sleep_at: None,
+            sleep_eot: false,
+            fail_streak: 0,
+            listen: 0.0,
+            counted: false,
+            last_tick: Instant::now(),
             shared: sh,
+            tx: tx2,
+            streams: Arc::new(Mutex::new(StreamCache::default())),
+            warm: false,
+            appended_warm: false,
+            last_prefetch: Instant::now(),
         };
         loop {
-            match rx.recv_timeout(Duration::from_millis(400)) {
-                Ok(Cmd::Play(q, i)) => {
-                    e.queue = q;
-                    e.play(i);
-                }
-                Ok(Cmd::Toggle) => e.toggle(),
-                Ok(Cmd::Next) => e.next(),
-                Ok(Cmd::Prev) => e.prev(),
-                Ok(Cmd::Seek(t)) => {
-                    let _ = mpv_cmd(json!(["seek", t, "absolute"]));
-                    e.shared.lock().unwrap().pos = t;
-                }
-                Ok(Cmd::Volume(v)) => {
-                    e.volume = v;
-                    let _ = mpv_cmd(json!(["set_property", "volume", v as f64]));
-                }
-                Ok(Cmd::Quit) => {
-                    e.kill();
-                    cleanup();
-                    std::process::exit(0);
+            let wait = if e.shared.lock().map(|s| s.playing).unwrap_or(false) { 250 } else { 600 };
+            let mut got_cmd = false;
+            match rx.recv_timeout(Duration::from_millis(wait)) {
+                Ok(c) => {
+                    got_cmd = true;
+                    match c {
+                        Cmd::Play(q, i) => e.set_queue(q, i),
+                        Cmd::Toggle => e.toggle(),
+                        Cmd::Next => e.advance(false),
+                        Cmd::Prev => e.prev(),
+                        Cmd::Seek(t) => {
+                            if let Some(ipc) = e.ipc.as_mut() {
+                                ipc.cmd(json!(["seek", t, "absolute"]));
+                            }
+                            e.shared.lock().unwrap_or_else(|p| p.into_inner()).pos = t;
+                        }
+                        Cmd::SeekBy(d) => {
+                            if let Some(ipc) = e.ipc.as_mut() {
+                                ipc.cmd(json!(["seek", d, "relative"]));
+                            }
+                        }
+                        Cmd::Volume(v) => {
+                            e.volume = v;
+                            if let Some(ipc) = e.ipc.as_mut() {
+                                ipc.set("volume", json!(v as f64));
+                            }
+                        }
+                        Cmd::Jump(i) => {
+                            e.waiting_radio = false;
+                            e.play(i);
+                        }
+                        Cmd::Enqueue(t) => e.enqueue(t),
+                        Cmd::PlayNext(t) => e.play_next(t),
+                        Cmd::RemoveAt(i) => e.remove_at(i),
+                        Cmd::MoveItem(a, b) => e.move_item(a, b),
+                        Cmd::ClearUpcoming => e.clear_upcoming(),
+                        Cmd::Shuffle(on) => e.set_shuffle(on),
+                        Cmd::SetRepeat(r) => {
+                            e.repeat = r;
+                            e.invalidate_prefetch();
+                            e.apply_repeat();
+                            e.publish_queue();
+                        }
+                        Cmd::Autoplay(on) => {
+                            e.autoplay = on;
+                            e.publish_queue();
+                        }
+                        Cmd::RadioResult(v) => {
+                            e.fetching = false;
+                            let have: std::collections::HashSet<String> = e.queue.iter().map(|t| t.id.clone()).collect();
+                            let fresh: Vec<Track> = v.into_iter().filter(|t| !have.contains(&t.id)).collect();
+                            if fresh.is_empty() {
+                                if e.waiting_radio {
+                                    e.waiting_radio = false;
+                                    e.stop();
+                                }
+                            } else {
+                                if let Some(o) = e.orig.as_mut() {
+                                    o.extend(fresh.clone());
+                                }
+                                e.queue.extend(fresh);
+                                e.publish_queue();
+                                if e.waiting_radio {
+                                    e.waiting_radio = false;
+                                    let n = e.idx + 1;
+                                    if n < e.queue.len() {
+                                        e.play(n);
+                                    }
+                                }
+                            }
+                        }
+                        Cmd::SetFx(fx) => {
+                            e.fx = fx;
+                            e.apply_fx();
+                        }
+                        Cmd::Sleep(m) => {
+                            e.sleep_at = m.map(|m| Instant::now() + Duration::from_secs(m * 60));
+                            e.sleep_eot = false;
+                            if m.is_none() {
+                                e.shared.lock().unwrap_or_else(|p| p.into_inner()).sleep_left = None;
+                            }
+                            e.publish_queue();
+                        }
+                        Cmd::SleepEndOfTrack(on) => {
+                            e.sleep_eot = on;
+                            if on {
+                                e.sleep_at = None;
+                                e.shared.lock().unwrap_or_else(|p| p.into_inner()).sleep_left = None;
+                                e.invalidate_prefetch();
+                            }
+                            e.publish_queue();
+                        }
+                        Cmd::Quit => {
+                            e.flush_listen();
+                            e.kill();
+                            cleanup();
+                            std::process::exit(0);
+                        }
+                    }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {
+                    e.flush_listen();
                     e.kill();
                     break;
                 }
             }
             e.tick();
-            repaint();
+            let active = e.shared.lock().map(|s| s.playing && !s.paused).unwrap_or(false);
+            if got_cmd || active {
+                repaint();
+            }
         }
     });
     (tx, shared)
@@ -1355,75 +2086,152 @@ pub fn spawn_viz() -> Arc<Mutex<VizData>> {
     data
 }
 
-// ---------------- window hiding (Hyprland special workspace) + tray ----------------
+// ---------------- window lifecycle (close-to-tray), tray, single-instance + CLI control ----------------
+//
+// Two processes, so closing the window really closes it on X11 and on every Wayland compositor:
+//   * the background process (plain `rustym`, or `rustym --background`): owns the engine, the tray icon,
+//     media keys and the control socket. It never opens a window itself, so it can never show
+//     "not responding".
+//   * the window process (`rustym --gui`, started by the background process): the egui UI. It talks to the
+//     background process over the control socket. Closing the window simply ends this process.
+// No "hide window" support is needed (winit's set_visible is unsupported on Wayland) and no windows are
+// re-created inside one process.
 
 pub struct WinCtl {
-    pub hidden: AtomicBool,
+    /// A window process is currently running.
+    pub gui_open: AtomicBool,
     pub want_show: AtomicBool,
+    /// Close the window process (the app keeps running).
     pub want_hide: AtomicBool,
 }
 
 impl WinCtl {
     pub fn new() -> Self {
-        WinCtl {
-            hidden: AtomicBool::new(false),
-            want_show: AtomicBool::new(false),
-            want_hide: AtomicBool::new(false),
-        }
+        WinCtl { gui_open: AtomicBool::new(false), want_show: AtomicBool::new(false), want_hide: AtomicBool::new(false) }
     }
 }
 
-pub fn is_hypr() -> bool {
-    std::env::var("HYPRLAND_INSTANCE_SIGNATURE").is_ok()
-}
-
-fn hyprctl(args: &[&str]) -> Option<String> {
-    let o = Command::new("hyprctl").args(args).output().ok()?;
-    Some(String::from_utf8_lossy(&o.stdout).to_string())
-}
-
-pub fn hide_window() {
-    let _ = hyprctl(&["dispatch", "movetoworkspacesilent", "special:rustym,class:^(rustym)$"]);
-}
-
-pub fn show_window() {
-    let id = hyprctl(&["activeworkspace", "-j"])
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .and_then(|v| v["id"].as_i64())
-        .unwrap_or(1);
-    let target = format!("{id},class:^(rustym)$");
-    let _ = hyprctl(&["dispatch", "movetoworkspace", target.as_str()]);
-    let _ = hyprctl(&["dispatch", "focuswindow", "class:^(rustym)$"]);
-}
-
-pub fn show_now(win: &WinCtl, repaint: &Repaint) {
-    win.hidden.store(false, SeqCst);
-    if is_hypr() {
-        show_window();
-    } else {
+pub fn show_now(win: &WinCtl) {
+    if !win.gui_open.load(SeqCst) {
         win.want_show.store(true, SeqCst);
-        repaint();
     }
 }
 
-pub fn toggle_window(win: &WinCtl, repaint: &Repaint) {
-    if win.hidden.load(SeqCst) {
-        show_now(win, repaint);
-    } else {
-        win.hidden.store(true, SeqCst);
-        if is_hypr() {
-            hide_window();
-        } else {
-            win.want_hide.store(true, SeqCst);
-            repaint();
-        }
+pub fn hide_now(win: &WinCtl) {
+    if win.gui_open.load(SeqCst) {
+        win.want_hide.store(true, SeqCst);
     }
 }
+
+pub fn toggle_window(win: &WinCtl) {
+    if win.gui_open.load(SeqCst) {
+        hide_now(win);
+    } else {
+        show_now(win);
+    }
+}
+
+/// Path of this executable, tolerant of the binary having been replaced while running.
+pub fn self_exe() -> PathBuf {
+    let p = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("rustym"));
+    let s = p.to_string_lossy().to_string();
+    match s.strip_suffix(" (deleted)") {
+        Some(t) => PathBuf::from(t),
+        None => p,
+    }
+}
+
+/// Starts the window process.
+pub fn spawn_gui() -> std::io::Result<Child> {
+    Command::new(self_exe()).arg("--gui").stdin(Stdio::null()).spawn()
+}
+
+// ----- tray detection -----
+
+/// Asks the session bus whether `name` has an owner. None = no D-Bus tool could answer.
+fn name_has_owner(name: &str) -> Option<bool> {
+    let sn = format!("string:{name}");
+    let owned = |v: &[&str]| -> Vec<String> { v.iter().map(|x| x.to_string()).collect() };
+    let attempts: [(&str, Vec<String>, &str); 3] = [
+        (
+            "busctl",
+            owned(&["--user", "call", "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "NameHasOwner", "s", name]),
+            "true",
+        ),
+        (
+            "gdbus",
+            owned(&["call", "--session", "--dest", "org.freedesktop.DBus", "--object-path", "/org/freedesktop/DBus", "--method", "org.freedesktop.DBus.NameHasOwner", name]),
+            "true",
+        ),
+        (
+            "dbus-send",
+            owned(&["--session", "--print-reply", "--dest=org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus.NameHasOwner", sn.as_str()]),
+            "boolean true",
+        ),
+    ];
+    for (bin, args, yes) in attempts {
+        if let Ok(o) = Command::new(bin).args(&args).stdin(Stdio::null()).stderr(Stdio::null()).output() {
+            if o.status.success() {
+                return Some(String::from_utf8_lossy(&o.stdout).contains(yes));
+            }
+        }
+    }
+    None
+}
+
+/// Some(true) when a StatusNotifier host (KDE, waybar, GNOME AppIndicator extension, ...) is running,
+/// Some(false) when none is, None when it could not be determined.
+fn watcher_present() -> Option<bool> {
+    let mut answered = false;
+    for name in ["org.kde.StatusNotifierWatcher", "org.freedesktop.StatusNotifierWatcher"] {
+        match name_has_owner(name) {
+            Some(true) => return Some(true),
+            Some(false) => answered = true,
+            None => {}
+        }
+    }
+    if answered {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Background process: true when our tray icon is registered and a tray host is still running.
+pub fn tray_available() -> bool {
+    TRAY_UP.load(SeqCst) && watcher_present() != Some(false)
+}
+
+/// Any process: is a tray host (StatusNotifierWatcher) running on this desktop?
+pub fn tray_host_running() -> bool {
+    watcher_present() != Some(false)
+}
+
+/// After close-to-tray without a tray icon: say once, via notification, how to reopen the window.
+pub fn warn_no_tray() {
+    std::thread::spawn(|| {
+        if tray_available() {
+            return;
+        }
+        let _ = Command::new("notify-send")
+            .args([
+                "--app-name=Rustym",
+                "--icon=rustym",
+                "--",
+                "Rustym is still running",
+                "No system tray found. Launch Rustym again (or run: rustym --show) to reopen the window. rustym --quit stops it.",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    });
+}
+
+// ----- tray icon -----
 
 struct RustymTray {
     tx: Sender<Cmd>,
     win: Arc<WinCtl>,
-    repaint: Repaint,
 }
 
 impl ksni::Tray for RustymTray {
@@ -1437,14 +2245,14 @@ impl ksni::Tray for RustymTray {
         "rustym".into()
     }
     fn activate(&mut self, _x: i32, _y: i32) {
-        toggle_window(&self.win, &self.repaint);
+        toggle_window(&self.win);
     }
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         use ksni::menu::StandardItem;
         vec![
             StandardItem {
                 label: "Show / Hide".into(),
-                activate: Box::new(|t: &mut RustymTray| toggle_window(&t.win, &t.repaint)),
+                activate: Box::new(|t: &mut RustymTray| toggle_window(&t.win)),
                 ..Default::default()
             }
             .into(),
@@ -1485,29 +2293,158 @@ impl ksni::Tray for RustymTray {
     }
 }
 
-pub fn spawn_tray(tx: Sender<Cmd>, win: Arc<WinCtl>, repaint: Repaint) {
-    ksni::TrayService::new(RustymTray { tx, win, repaint }).spawn();
+/// Registers the tray icon as soon as a tray host exists. Many sessions start the panel *after*
+/// autostarted apps, so this waits instead of registering into the void and giving up.
+pub fn spawn_tray(tx: Sender<Cmd>, win: Arc<WinCtl>) {
+    std::thread::spawn(move || {
+        loop {
+            match watcher_present() {
+                Some(false) => std::thread::sleep(Duration::from_secs(2)),
+                _ => break, // present, or unknown: register anyway
+            }
+        }
+        ksni::TrayService::new(RustymTray { tx, win }).spawn();
+        TRAY_UP.store(true, SeqCst);
+        log(0, "tray", "tray icon registered");
+    });
 }
 
-// ---------------- single instance ----------------
+// ----- single instance + remote control -----
 
-/// If another rustym is running, ask it to show its window and return true.
-pub fn ping_existing() -> bool {
-    if let Ok(mut s) = UnixStream::connect(LOCK) {
-        let _ = s.write_all(b"show\n");
+/// Sends one command line to the running instance. Returns false when none is running.
+pub fn send_instance(cmd: &str) -> bool {
+    if let Ok(mut s) = UnixStream::connect(lock_path()) {
+        let _ = s.write_all(format!("{cmd}\n").as_bytes());
         return true;
     }
     false
 }
 
-pub fn listen_instance(win: Arc<WinCtl>, repaint: Repaint) {
-    let _ = std::fs::remove_file(LOCK);
-    let Ok(l) = UnixListener::bind(LOCK) else { return };
+/// Background process: serves the control socket. Short one-word commands come from the CLI / second
+/// launches; the window process keeps a connection open, sends `cmd <json>`, polls `state` and fetches
+/// `queue` whenever the queue version changed.
+pub fn listen_instance(win: Arc<WinCtl>, tx: Sender<Cmd>, shared: Arc<Mutex<Shared>>) {
+    let path = lock_path();
+    let _ = std::fs::remove_file(&path);
+    let Ok(l) = UnixListener::bind(&path) else { return };
+    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     std::thread::spawn(move || {
         for s in l.incoming() {
-            if s.is_ok() {
-                show_now(&win, &repaint);
-            }
+            let Ok(s) = s else { continue };
+            let (win, tx, shared) = (win.clone(), tx.clone(), shared.clone());
+            std::thread::spawn(move || {
+                let Ok(mut w) = s.try_clone() else { return };
+                for line in BufReader::new(s).lines() {
+                    let Ok(line) = line else { break };
+                    let line = line.trim();
+                    if let Some(js) = line.strip_prefix("cmd ") {
+                        if let Ok(c) = serde_json::from_str::<Cmd>(js) {
+                            let _ = tx.send(c);
+                        }
+                        continue;
+                    }
+                    match line {
+                        "state" => {
+                            let j = serde_json::to_string(&*shared.lock().unwrap_or_else(|p| p.into_inner())).unwrap_or_default();
+                            if writeln!(w, "{j}").is_err() {
+                                break;
+                            }
+                        }
+                        "queue" => {
+                            let q = shared.lock().unwrap_or_else(|p| p.into_inner()).queue.clone();
+                            let j = serde_json::to_string(&*q).unwrap_or_else(|_| "[]".into());
+                            if writeln!(w, "{j}").is_err() {
+                                break;
+                            }
+                        }
+                        "toggle" => toggle_window(&win),
+                        "hide" => hide_now(&win),
+                        "playpause" => {
+                            let _ = tx.send(Cmd::Toggle);
+                        }
+                        "next" => {
+                            let _ = tx.send(Cmd::Next);
+                        }
+                        "prev" => {
+                            let _ = tx.send(Cmd::Prev);
+                        }
+                        "quit" => {
+                            let _ = tx.send(Cmd::Quit);
+                        }
+                        "ping" => {}
+                        _ => show_now(&win), // "show", an empty line, or an older client
+                    }
+                }
+            });
         }
     });
+}
+
+/// Window process: connects to the background process. Returns a command sender and a state snapshot
+/// that is refreshed ~10x per second (`repaint` is called when something visible changed). If the
+/// background process goes away, this process exits too.
+pub fn connect_backend(repaint: Repaint) -> (Sender<Cmd>, Arc<Mutex<Shared>>) {
+    let (tx, rx) = channel::<Cmd>();
+    let shared = Arc::new(Mutex::new(Shared::default()));
+    let sh = shared.clone();
+    std::thread::spawn(move || {
+        let mut stream = None;
+        for _ in 0..50 {
+            if let Ok(s) = UnixStream::connect(lock_path()) {
+                stream = Some(s);
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let Some(stream) = stream else { std::process::exit(1) };
+        let Ok(mut w) = stream.try_clone() else { std::process::exit(1) };
+        let mut r = BufReader::new(stream);
+        let mut queue: Arc<Vec<Track>> = Arc::new(vec![]);
+        let mut queue_ver = u64::MAX;
+        let mut last_sig: (Option<String>, bool, bool, bool, u64, usize) = (None, false, false, false, 0, 0);
+        loop {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(c) => {
+                    if let Ok(j) = serde_json::to_string(&c) {
+                        if writeln!(w, "cmd {j}").is_err() {
+                            std::process::exit(0);
+                        }
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+            if writeln!(w, "state").is_err() {
+                std::process::exit(0);
+            }
+            let mut line = String::new();
+            match r.read_line(&mut line) {
+                Ok(0) | Err(_) => std::process::exit(0),
+                Ok(_) => {}
+            }
+            let Ok(mut st) = serde_json::from_str::<Shared>(line.trim()) else { continue };
+            if st.queue_ver != queue_ver {
+                if writeln!(w, "queue").is_err() {
+                    std::process::exit(0);
+                }
+                let mut ql = String::new();
+                match r.read_line(&mut ql) {
+                    Ok(0) | Err(_) => std::process::exit(0),
+                    Ok(_) => {}
+                }
+                if let Ok(v) = serde_json::from_str::<Vec<Track>>(ql.trim()) {
+                    queue = Arc::new(v);
+                    queue_ver = st.queue_ver;
+                }
+            }
+            st.queue = queue.clone();
+            let sig = (st.current.as_ref().map(|t| t.id.clone()), st.playing, st.paused, st.loading, st.queue_ver, st.error.len());
+            if sig != last_sig {
+                last_sig = sig;
+                repaint();
+            }
+            *sh.lock().unwrap_or_else(|p| p.into_inner()) = st;
+        }
+    });
+    (tx, shared)
 }

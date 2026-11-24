@@ -1,14 +1,21 @@
 //! Rustym - simple, ad-free YouTube Music player (UI).
 
+mod distro;
 mod engine;
+mod local;
+mod lyrics;
+mod mpris;
+mod pages;
+mod store;
+mod ytm;
 
 use eframe::egui::{
     self, Align, Align2, Color32, FontData, FontDefinitions, FontFamily, FontId, ImageSource, Layout, Margin,
-    Pos2, Rect, RichText, Sense, Shape, Stroke, Vec2, ViewportCommand,
+    Pos2, Rect, RichText, Sense, Shape, Stroke, Vec2,
 };
 use engine::*;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, Ordering::SeqCst},
         mpsc::{channel, Receiver, Sender},
@@ -98,6 +105,27 @@ enum Msg {
     LoginOk(Option<String>),
     LoginFail(String),
     LoginProgress(String),
+    Home(Vec<ytm::Shelf>),
+    HomeErr(String),
+    SearchRes(u64, ytm::SearchOut),
+    Suggest(u64, Vec<String>),
+    Detail(u64, ytm::Detail),
+    DetailErr(u64, String),
+    /// 0 = albums, 1 = artists
+    Cards(u8, Vec<ytm::Card>),
+    CardsErr(u8, String),
+    History(Vec<(String, Vec<Track>)>),
+    HistoryErr(String),
+    Lyrics(String, lyrics::Lyrics),
+    LyricsErr(String, String),
+    LikedIds(Vec<String>),
+    /// Google account name + avatar URL.
+    Account(String, String),
+    Toast(String),
+    PlayNow(Vec<Track>),
+    Local(Vec<Track>),
+    /// Something changed in the YouTube library: reload the playlist list.
+    LibraryChanged,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -112,12 +140,24 @@ enum View {
     Playlist(usize),
     Settings,
     Logs,
+    Albums,
+    Artists,
+    History,
+    Stats,
+    Local,
+    Detail,
 }
 
 enum Act {
     Play(usize),
     Add(usize),
     Remove(usize),
+    PlayNext(usize),
+    Enqueue(usize),
+    Like(usize),
+    Radio(usize),
+    ToArtist(usize),
+    ToAlbum(usize),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -296,20 +336,64 @@ fn play_bubble(p: &egui::Painter, th: Theme, c: Pos2, k: f32) {
     ));
 }
 
+/// Draws `text` on one line at `pos` (left-centre) and ends it with "…" when it is wider than
+/// `max_w`, instead of being chopped off at the card edge.
+fn ellipsis_text(p: &egui::Painter, pos: Pos2, text: &str, font: FontId, color: Color32, max_w: f32) {
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
+    job.wrap = egui::text::TextWrapping {
+        max_width: max_w.max(1.0),
+        max_rows: 1,
+        break_anywhere: true,
+        overflow_character: Some('…'),
+    };
+    let galley = p.layout_job(job);
+    let top_left = Pos2::new(pos.x, pos.y - galley.size().y / 2.0);
+    p.galley(top_left, galley, color);
+}
+
+/// UV rectangle that crops an image of `img` pixels so it *covers* a box of `boxs` without
+/// stretching (centre crop).
+fn cover_uv(img: Vec2, boxs: Vec2) -> Rect {
+    if img.x <= 0.0 || img.y <= 0.0 || boxs.x <= 0.0 || boxs.y <= 0.0 {
+        return Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+    }
+    let ia = img.x / img.y;
+    let ba = boxs.x / boxs.y;
+    if ia > ba {
+        let w = ba / ia;
+        Rect::from_min_max(Pos2::new((1.0 - w) / 2.0, 0.0), Pos2::new((1.0 + w) / 2.0, 1.0))
+    } else {
+        let h = ia / ba;
+        Rect::from_min_max(Pos2::new(0.0, (1.0 - h) / 2.0), Pos2::new(1.0, (1.0 + h) / 2.0))
+    }
+}
+
+/// Network picture that fills `rect` (cropped, never stretched). Used by the home page cards.
+pub(crate) fn cover_image(ui: &egui::Ui, uri: &str, rect: Rect, radius: f32) {
+    let img = egui::Image::new(ImageSource::Uri(uri.to_owned().into()));
+    let uv = match img.load_for_size(ui.ctx(), rect.size()) {
+        Ok(egui::load::TexturePoll::Ready { texture }) => cover_uv(texture.size, rect.size()),
+        _ => Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+    };
+    img.uv(uv).fit_to_exact_size(rect.size()).rounding(radius).paint_at(ui, rect);
+}
+
 fn track_card(ui: &mut egui::Ui, th: Theme, t: &Track, w: f32) -> egui::Response {
-    let ih = ((w - 20.0) * 9.0 / 16.0).floor();
-    let h = ih + 20.0 + 50.0;
+    // Square artwork (like the shelves above). The old 16:9 box stretched the square crop of the
+    // thumbnail sideways, which is why album art looked squashed.
+    let side = (w - 20.0).floor();
+    let h = side + 20.0 + 50.0;
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, h), Sense::click());
     let k = ui.ctx().animate_bool(resp.id, resp.hovered());
     let p = ui.painter();
     p.rect_filled(rect, 14.0, lerp_col(th.card, th.card2, k));
-    let img = Rect::from_min_size(rect.min + Vec2::splat(10.0), Vec2::new(w - 20.0, ih));
+    let img = Rect::from_min_size(rect.min + Vec2::splat(10.0), Vec2::splat(side));
     thumb(ui, &t.id, img, 10.0);
+    let p = ui.painter();
     play_bubble(p, th, img.right_bottom() + Vec2::new(-28.0, -28.0 + 6.0 * (1.0 - k)), k);
-    let clip = Rect::from_min_max(Pos2::new(rect.left() + 10.0, rect.top()), Pos2::new(rect.right() - 10.0, rect.bottom()));
-    let tc = p.with_clip_rect(clip);
-    tc.text(Pos2::new(rect.left() + 12.0, img.bottom() + 17.0), Align2::LEFT_CENTER, &t.title, FontId::proportional(14.5), th.text);
-    tc.text(Pos2::new(rect.left() + 12.0, img.bottom() + 37.0), Align2::LEFT_CENTER, &t.artist, FontId::proportional(12.5), th.dim);
+    let tw = w - 24.0;
+    ellipsis_text(p, Pos2::new(rect.left() + 12.0, img.bottom() + 17.0), &t.title, FontId::proportional(14.5), th.text, tw);
+    ellipsis_text(p, Pos2::new(rect.left() + 12.0, img.bottom() + 37.0), &t.artist, FontId::proportional(12.5), th.dim, tw);
     if resp.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
@@ -338,6 +422,29 @@ fn mix_card(ui: &mut egui::Ui, th: Theme, title: &str, sub: &str, c1: Color32, c
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
     resp
+}
+
+/// First `n` characters of a name, with "…" when it was cut.
+fn short_name(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(n).collect::<String>())
+    }
+}
+
+/// Round Google account picture (falls back to the first letter of the name).
+fn account_avatar(ui: &mut egui::Ui, th: Theme, photo: &str, name: &str, size: f32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    if photo.is_empty() {
+        let p = ui.painter();
+        p.circle_filled(rect.center(), size / 2.0, th.accent);
+        let letter = name.chars().next().map(|c| c.to_uppercase().to_string()).unwrap_or_else(|| "?".into());
+        p.text(rect.center(), Align2::CENTER_CENTER, letter, FontId::proportional(size * 0.46), Color32::WHITE);
+    } else {
+        ui.painter().circle_filled(rect.center(), size / 2.0, th.card2);
+        cover_image(ui, photo, rect, size / 2.0);
+    }
 }
 
 fn greeting() -> String {
@@ -390,7 +497,15 @@ fn vgradient(p: &egui::Painter, r: Rect, top: Color32, bot: Color32) {
 }
 
 fn thumb(ui: &egui::Ui, id: &str, rect: Rect, radius: f32) {
-    egui::Image::new(ImageSource::Uri(format!("https://i.ytimg.com/vi/{id}/mqdefault.jpg").into()))
+    if id.starts_with("local:") {
+        ui.painter().rect_filled(rect, radius, ui.visuals().extreme_bg_color);
+        ui.painter().text(rect.center(), Align2::CENTER_CENTER, "FILE", FontId::proportional(11.0), ui.visuals().weak_text_color());
+        return;
+    }
+    // YouTube video thumbnails are 16:9. Crop the left/right edges so the
+    // poster artwork fills this square tile instead of letterboxing/stretching.
+    egui::Image::new(ImageSource::Uri(format!("https://i.ytimg.com/vi/{id}/maxresdefault.jpg").into()))
+        .uv(Rect::from_min_max(Pos2::new(0.21875, 0.0), Pos2::new(0.78125, 1.0)))
         .fit_to_exact_size(rect.size())
         .rounding(radius)
         .paint_at(ui, rect);
@@ -525,27 +640,91 @@ fn accent_button(th: Theme, text: &str) -> egui::Button<'static> {
         .rounding(8.0)
 }
 
+/// Load system fonts as fallbacks for scripts egui's built-in font lacks
+/// (Bengali, Gurmukhi, Gujarati, Odia, Sinhala, Tamil, Devanagari, Telugu,
+/// Kannada, Malayalam, Arabic, Thai, CJK ...). Looks in several common
+/// distro locations and also asks fontconfig, so it works on Arch, Debian/Ubuntu,
+/// Fedora, etc.
 fn setup_fonts(ctx: &egui::Context) {
+    use std::path::{Path, PathBuf};
     let mut fonts = FontDefinitions::default();
-    let paths = [
-        "/usr/share/fonts/noto/NotoSansTamil-Regular.ttf",
-        "/usr/share/fonts/noto/NotoSansDevanagari-Regular.ttf",
-        "/usr/share/fonts/noto/NotoSansTelugu-Regular.ttf",
-        "/usr/share/fonts/noto/NotoSansMalayalam-Regular.ttf",
-        "/usr/share/fonts/noto/NotoSansKannada-Regular.ttf",
-        "/usr/share/fonts/noto/NotoSansArabic-Regular.ttf",
-        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+
+    let dirs = [
+        "/usr/share/fonts/noto",
+        "/usr/share/fonts/truetype/noto",
+        "/usr/share/fonts/opentype/noto",
+        "/usr/share/fonts/noto-cjk",
+        "/usr/share/fonts/google-noto",
+        "/usr/share/fonts/google-noto-vf",
+        "/usr/share/fonts/google-noto-cjk",
+        "/usr/share/fonts/truetype/lohit",
+        "/usr/share/fonts/truetype/freefont",
+        "/usr/share/fonts/TTF",
+        "/usr/share/fonts/truetype",
+        "/usr/share/fonts/opentype",
     ];
-    for (i, p) in paths.iter().enumerate() {
-        if let Ok(bytes) = std::fs::read(p) {
-            let name = format!("sysfont{i}");
-            fonts.font_data.insert(name.clone(), FontData::from_owned(bytes));
-            if let Some(f) = fonts.families.get_mut(&FontFamily::Proportional) {
-                f.push(name);
+    // File-name stems, in priority order. Bengali first.
+    let stems = [
+        "NotoSansBengali", "NotoSansBengaliUI",
+        "NotoSansDevanagari", "NotoSansTamil", "NotoSansTelugu", "NotoSansKannada",
+        "NotoSansMalayalam", "NotoSansGujarati", "NotoSansGurmukhi", "NotoSansOriya",
+        "NotoSansSinhala", "NotoSansArabic", "NotoSansThai", "NotoSansCJK-Regular",
+        "NotoSansCJKjp-Regular",
+    ];
+    let mut found: Vec<PathBuf> = Vec::new();
+    let push = |p: PathBuf, found: &mut Vec<PathBuf>| {
+        if p.is_file() && !found.contains(&p) {
+            found.push(p);
+        }
+    };
+    for stem in stems {
+        for d in dirs {
+            for ext in ["-Regular.ttf", "-Regular.otf", "[wdth,wght].ttf", "-VF.ttf", ".ttf", "-Regular.ttc"] {
+                push(Path::new(d).join(format!("{stem}{ext}")), &mut found);
             }
         }
     }
+    // Fontconfig lookups cover fonts in unusual locations or with other names.
+    for query in [
+        ":lang=bn", ":lang=hi", ":lang=ta", ":lang=te", ":lang=kn", ":lang=ml",
+        ":lang=gu", ":lang=pa", ":lang=or", ":lang=si", ":lang=ar", ":lang=th", ":lang=ja",
+    ] {
+        if let Ok(out) = std::process::Command::new("fc-match")
+            .args(["-f", "%{file}", query])
+            .output()
+        {
+            if out.status.success() {
+                let f = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !f.is_empty() {
+                    push(PathBuf::from(f), &mut found);
+                }
+            }
+        }
+    }
+
+    for (i, p) in found.iter().enumerate() {
+        if let Ok(bytes) = std::fs::read(p) {
+            let name = format!("sysfont{i}");
+            fonts.font_data.insert(name.clone(), FontData::from_owned(bytes));
+            for fam in [FontFamily::Proportional, FontFamily::Monospace] {
+                if let Some(f) = fonts.families.get_mut(&fam) {
+                    f.push(name.clone());
+                }
+            }
+        }
+    }
+    // Last-resort fallback bundled in the binary, so Bengali always renders even when
+    // no system Bengali font is installed. System fonts above take priority.
+    fonts.font_data.insert(
+        "bundled-bengali".to_owned(),
+        FontData::from_static(include_bytes!("../assets/fonts/FreeSans-Bengali-subset.ttf")),
+    );
+    for fam in [FontFamily::Proportional, FontFamily::Monospace] {
+        if let Some(f) = fonts.families.get_mut(&fam) {
+            f.push("bundled-bengali".to_owned());
+        }
+    }
+    eprintln!("[rustym] fonts: {} system fallback fonts loaded: {:?}", found.len(), found);
     ctx.set_fonts(fonts);
 }
 
@@ -611,7 +790,111 @@ fn draw_viz(ui: &mut egui::Ui, th: Theme, lv: &[f32], style: usize, size: Vec2) 
     resp
 }
 
-fn draw_tracks(ui: &mut egui::Ui, th: Theme, tracks: &[Track], cur: Option<&str>, removable: bool) -> Option<Act> {
+/// One song row. Left click plays, "+" adds to a playlist, right click opens the song menu.
+#[allow(clippy::too_many_arguments)]
+fn track_row(
+    ui: &mut egui::Ui,
+    th: Theme,
+    t: &Track,
+    i: usize,
+    salt: &str,
+    cur: Option<&str>,
+    removable: bool,
+    liked: &HashSet<String>,
+    act: &mut Option<Act>,
+) {
+    let row_h = 58.0;
+    ui.push_id((salt, i), |ui| {
+        let playing = cur == Some(t.id.as_str());
+        let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), row_h), Sense::click());
+        let hovered = resp.hovered();
+        let p = ui.painter();
+        if playing {
+            p.rect_filled(rect, 10.0, th.accent.gamma_multiply(0.12));
+        } else if hovered {
+            p.rect_filled(rect, 10.0, th.card);
+        }
+        let img = Rect::from_min_size(rect.min + Vec2::new(8.0, 6.5), Vec2::new(45.0, 45.0));
+        thumb(ui, &t.id, img, 8.0);
+        let tx = img.right() + 14.0;
+        let clip = Rect::from_min_max(Pos2::new(tx, rect.top()), Pos2::new(rect.right() - 116.0, rect.bottom()));
+        let pc = p.with_clip_rect(clip);
+        pc.text(
+            Pos2::new(tx, rect.center().y - 10.0),
+            Align2::LEFT_CENTER,
+            &t.title,
+            FontId::proportional(15.0),
+            if playing { th.accent } else { th.text },
+        );
+        let sub = if t.album.is_empty() { t.artist.clone() } else { format!("{} · {}", t.artist, t.album) };
+        pc.text(Pos2::new(tx, rect.center().y + 11.0), Align2::LEFT_CENTER, sub, FontId::proportional(13.0), th.dim);
+        if let Some(d) = t.dur {
+            p.text(Pos2::new(rect.right() - 14.0, rect.center().y), Align2::RIGHT_CENTER, fmt_time(d), FontId::proportional(13.0), th.dim);
+        }
+        // + (add to playlist) or x (remove) button
+        let bc = Pos2::new(rect.right() - 76.0, rect.center().y);
+        let br = Rect::from_center_size(bc, Vec2::splat(30.0));
+        let bresp = ui.interact(br, ui.make_persistent_id(("rowbtn", i)), Sense::click());
+        let col = if bresp.hovered() { th.accent } else if hovered { th.dim2 } else { th.dim };
+        let st = Stroke::new(2.0_f32, col);
+        let p = ui.painter();
+        if removable {
+            p.line_segment([bc + Vec2::new(-5.0, -5.0), bc + Vec2::new(5.0, 5.0)], st);
+            p.line_segment([bc + Vec2::new(-5.0, 5.0), bc + Vec2::new(5.0, -5.0)], st);
+        } else {
+            p.line_segment([bc + Vec2::new(-6.0, 0.0), bc + Vec2::new(6.0, 0.0)], st);
+            p.line_segment([bc + Vec2::new(0.0, -6.0), bc + Vec2::new(0.0, 6.0)], st);
+        }
+        if hovered {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if bresp.clicked() {
+            *act = Some(if removable { Act::Remove(i) } else { Act::Add(i) });
+        } else if resp.clicked() {
+            *act = Some(Act::Play(i));
+        }
+        let is_liked = liked.contains(&t.id);
+        let local = !t.local.is_empty();
+        resp.context_menu(|ui| {
+            if ui.button("Play next").clicked() {
+                *act = Some(Act::PlayNext(i));
+                ui.close_menu();
+            }
+            if ui.button("Add to queue").clicked() {
+                *act = Some(Act::Enqueue(i));
+                ui.close_menu();
+            }
+            if ui.button("Add to playlist…").clicked() {
+                *act = Some(Act::Add(i));
+                ui.close_menu();
+            }
+            if !local {
+                if ui.button(if is_liked { "Unlike" } else { "Like" }).clicked() {
+                    *act = Some(Act::Like(i));
+                    ui.close_menu();
+                }
+                if ui.button("Start radio").clicked() {
+                    *act = Some(Act::Radio(i));
+                    ui.close_menu();
+                }
+                if !t.artist_id.is_empty() && ui.button("Go to artist").clicked() {
+                    *act = Some(Act::ToArtist(i));
+                    ui.close_menu();
+                }
+                if !t.album_id.is_empty() && ui.button("Go to album").clicked() {
+                    *act = Some(Act::ToAlbum(i));
+                    ui.close_menu();
+                }
+            }
+            if removable && ui.button("Remove from this playlist").clicked() {
+                *act = Some(Act::Remove(i));
+                ui.close_menu();
+            }
+        });
+    });
+}
+
+fn draw_tracks(ui: &mut egui::Ui, th: Theme, tracks: &[Track], cur: Option<&str>, removable: bool, liked: &HashSet<String>) -> Option<Act> {
     let row_h = 58.0;
     let mut act: Option<Act> = None;
     egui::ScrollArea::vertical()
@@ -619,69 +902,37 @@ fn draw_tracks(ui: &mut egui::Ui, th: Theme, tracks: &[Track], cur: Option<&str>
         .show_rows(ui, row_h, tracks.len(), |ui, range| {
             ui.spacing_mut().item_spacing.y = 2.0;
             for i in range {
-                let t = &tracks[i];
-                let playing = cur == Some(t.id.as_str());
-                let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), row_h), Sense::click());
-                let hovered = resp.hovered();
-                let p = ui.painter();
-                if playing {
-                    p.rect_filled(rect, 10.0, th.accent.gamma_multiply(0.12));
-                } else if hovered {
-                    p.rect_filled(rect, 10.0, th.card);
-                }
-                let img = Rect::from_min_size(rect.min + Vec2::new(8.0, 6.5), Vec2::new(80.0, 45.0));
-                thumb(ui, &t.id, img, 8.0);
-                let tx = img.right() + 14.0;
-                let clip = Rect::from_min_max(Pos2::new(tx, rect.top()), Pos2::new(rect.right() - 116.0, rect.bottom()));
-                let pc = p.with_clip_rect(clip);
-                pc.text(
-                    Pos2::new(tx, rect.center().y - 10.0),
-                    Align2::LEFT_CENTER,
-                    &t.title,
-                    FontId::proportional(15.0),
-                    if playing { th.accent } else { th.text },
-                );
-                pc.text(
-                    Pos2::new(tx, rect.center().y + 11.0),
-                    Align2::LEFT_CENTER,
-                    &t.artist,
-                    FontId::proportional(13.0),
-                    th.dim,
-                );
-                if let Some(d) = t.dur {
-                    p.text(
-                        Pos2::new(rect.right() - 14.0, rect.center().y),
-                        Align2::RIGHT_CENTER,
-                        fmt_time(d),
-                        FontId::proportional(13.0),
-                        th.dim,
-                    );
-                }
-                // + (add to playlist) or x (remove) button
-                let bc = Pos2::new(rect.right() - 76.0, rect.center().y);
-                let br = Rect::from_center_size(bc, Vec2::splat(30.0));
-                let bresp = ui.interact(br, ui.make_persistent_id(("rowbtn", i)), Sense::click());
-                let col = if bresp.hovered() { th.accent } else if hovered { th.dim2 } else { th.dim };
-                let st = Stroke::new(2.0_f32, col);
-                let p = ui.painter();
-                if removable {
-                    p.line_segment([bc + Vec2::new(-5.0, -5.0), bc + Vec2::new(5.0, 5.0)], st);
-                    p.line_segment([bc + Vec2::new(-5.0, 5.0), bc + Vec2::new(5.0, -5.0)], st);
-                } else {
-                    p.line_segment([bc + Vec2::new(-6.0, 0.0), bc + Vec2::new(6.0, 0.0)], st);
-                    p.line_segment([bc + Vec2::new(0.0, -6.0), bc + Vec2::new(0.0, 6.0)], st);
-                }
-                if hovered {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                }
-                if bresp.clicked() {
-                    act = Some(if removable { Act::Remove(i) } else { Act::Add(i) });
-                } else if resp.clicked() {
-                    act = Some(Act::Play(i));
-                }
+                track_row(ui, th, &tracks[i], i, "tr", cur, removable, liked, &mut act);
             }
         });
     act
+}
+
+// Create/remove a standard XDG autostart entry for Linux desktop sessions.
+fn set_desktop_autostart(enabled: bool) -> std::io::Result<()> {
+    let base = match std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        Some(v) => std::path::PathBuf::from(v),
+        None => std::env::var_os("HOME")
+            .map(|h| std::path::PathBuf::from(h).join(".config"))
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is not set"))?,
+    };
+    let dir = base.join("autostart");
+    let file = dir.join("rustym.desktop");
+    if enabled {
+        std::fs::create_dir_all(&dir)?;
+        let exe = std::env::current_exe()?;
+        let escaped = exe.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+        // X-GNOME / X-KDE / X-MATE keys make the entry honoured by every common desktop.
+        std::fs::write(
+            file,
+            format!(
+                "[Desktop Entry]\nType=Application\nName=Rustym\nComment=Ad-free YouTube Music\nExec=\"{escaped}\" --show\nIcon=rustym\nTerminal=false\nX-GNOME-Autostart-enabled=true\nX-KDE-autostart-after=panel\nX-MATE-Autostart-enabled=true\n"
+            ),
+        )?;
+    } else if file.exists() {
+        std::fs::remove_file(file)?;
+    }
+    Ok(())
 }
 
 // ---------------- app ----------------
@@ -692,7 +943,6 @@ struct Rustym {
     cmd: Sender<Cmd>,
     shared: Arc<Mutex<Shared>>,
     viz: Arc<Mutex<VizData>>,
-    win: Arc<WinCtl>,
     snap: Shared,
     query: String,
     label: String,
@@ -721,6 +971,49 @@ struct Rustym {
     t0: Instant,
     msg_tx: Sender<Msg>,
     msg_rx: Receiver<Msg>,
+    // ---- v0.4 ----
+    shelves: Vec<ytm::Shelf>,
+    home_loading: bool,
+    sres: ytm::SearchOut,
+    sfilter: usize,
+    suggestions: Vec<String>,
+    sug_req: u64,
+    sug_dirty: bool,
+    sug_t: Instant,
+    show_sug: bool,
+    detail: Option<ytm::Detail>,
+    detail_kind: ytm::Kind,
+    detail_id: String,
+    back: Vec<View>,
+    lib_albums: Vec<ytm::Card>,
+    lib_artists: Vec<ytm::Card>,
+    lib_loading: bool,
+    lib_err: String,
+    history: Vec<(String, Vec<Track>)>,
+    hist_loading: bool,
+    hist_err: String,
+    hist_local: bool,
+    lyrics_for: String,
+    lyrics: Option<lyrics::Lyrics>,
+    lyrics_loading: bool,
+    lyrics_err: String,
+    lyric_cur: Option<usize>,
+    liked_ids: HashSet<String>,
+    toast: Option<(String, Instant)>,
+    local_tracks: Vec<Track>,
+    local_input: String,
+    show_queue: bool,
+    fx_open: bool,
+    help_open: bool,
+    open_detail_later: Option<(ytm::Kind, String)>,
+    /// Whether lyrics are enabled in Now Playing; remains on as the queue advances.
+    lyrics_enabled: bool,
+    /// Last time listening stats were re-read from disk (the background process writes them).
+    store_t: Instant,
+    tray_ok: bool,
+    tray_checked: Instant,
+    last_current_id: String,
+    startup_minimise_pending: bool,
 }
 
 impl Rustym {
@@ -730,26 +1023,26 @@ impl Rustym {
         egui_extras::install_image_loaders(&cc.egui_ctx);
         setup_fonts(&cc.egui_ctx);
         apply_theme(&cc.egui_ctx, &theme);
+        cc.egui_ctx.set_zoom_factor((cfg.ui_scale / 100.0).clamp(0.80, 1.25));
 
         let c2 = cc.egui_ctx.clone();
         let repaint: Repaint = Arc::new(move || c2.request_repaint());
-        let (cmd, shared) = spawn_engine(cfg.volume, repaint.clone());
+        // This is the window process. The engine, tray icon and media keys live in the background
+        // process; the window just talks to it, so closing the window never interrupts playback.
+        let (cmd, shared) = connect_backend(repaint.clone());
         let viz = spawn_viz();
-        let win = Arc::new(WinCtl::new());
-        spawn_tray(cmd.clone(), win.clone(), repaint.clone());
-        listen_instance(win.clone(), repaint);
 
         let (msg_tx, msg_rx) = channel();
         let trending = cfg.trending.clone();
         let remote = cfg.remote.clone();
         let signed = cfg.signed_in;
+        let auto_show_lyrics = cfg.auto_show_lyrics;
         let mut app = Rustym {
             cfg,
             theme,
             cmd,
             shared,
             viz,
-            win,
             snap: Shared::default(),
             query: String::new(),
             label: "Home".into(),
@@ -778,7 +1071,57 @@ impl Rustym {
             t0: Instant::now(),
             msg_tx,
             msg_rx,
+            shelves: vec![],
+            home_loading: false,
+            sres: ytm::SearchOut::default(),
+            sfilter: 0,
+            suggestions: vec![],
+            sug_req: 0,
+            sug_dirty: false,
+            sug_t: Instant::now(),
+            show_sug: false,
+            detail: None,
+            detail_kind: ytm::Kind::Album,
+            detail_id: String::new(),
+            back: vec![],
+            lib_albums: vec![],
+            lib_artists: vec![],
+            lib_loading: false,
+            lib_err: String::new(),
+            history: vec![],
+            hist_loading: false,
+            hist_err: String::new(),
+            hist_local: false,
+            lyrics_for: String::new(),
+            lyrics: None,
+            lyrics_loading: false,
+            lyrics_err: String::new(),
+            lyric_cur: None,
+            // saved liked songs make the Like buttons right before the network answers
+            liked_ids: if signed { liked_cache_load().into_iter().map(|t| t.id).collect() } else { HashSet::new() },
+            toast: None,
+            local_tracks: vec![],
+            local_input: String::new(),
+            show_queue: false,
+            fx_open: false,
+            help_open: false,
+            open_detail_later: None,
+            lyrics_enabled: auto_show_lyrics,
+            store_t: Instant::now().checked_sub(Duration::from_secs(10)).unwrap_or_else(Instant::now),
+            tray_ok: true,
+            tray_checked: Instant::now(),
+            last_current_id: String::new(),
+            startup_minimise_pending: true,
         };
+        let _ = app.cmd.send(Cmd::Shuffle(app.cfg.shuffle));
+        let _ = app.cmd.send(Cmd::SetRepeat(app.cfg.repeat));
+        let _ = app.cmd.send(Cmd::Autoplay(app.cfg.autoplay));
+        let _ = app.cmd.send(Cmd::SetFx(app.cfg.fx.clone()));
+        app.fetch_home(&cc.egui_ctx);
+        if signed {
+            app.fetch_liked_ids(&cc.egui_ctx);
+            app.fetch_account(&cc.egui_ctx);
+        }
         app.fetch_trending(&cc.egui_ctx);
         if signed {
             app.fetch_remote(&cc.egui_ctx);
@@ -803,7 +1146,8 @@ impl Rustym {
                 "--no-warnings".into(),
                 "ytsearch16:top songs this week official audio".into(),
             ];
-            let m = match run_ytdlp(args) {
+            let native = ytm::search("top songs this week", 1).map(|o| o.songs);
+            let m = match native.or_else(|_| run_ytdlp(args)) {
                 Ok(t) => Msg::Trending(t),
                 Err(e) => Msg::TrendingErr(e),
             };
@@ -888,21 +1232,19 @@ impl Rustym {
             return;
         }
         self.tracks.clear();
-        let args = vec![
-            "--flat-playlist".to_string(),
-            "--dump-json".to_string(),
-            "--no-warnings".to_string(),
-            format!("ytsearch30:{}", m.query),
-        ];
-        self.start(ctx, m.title.to_string(), args);
+        self.start_query(ctx, m.title.to_string(), m.query.to_string());
     }
 
     fn sign_out(&mut self) {
         self.cfg.signed_in = false;
+        self.cfg.account_name.clear();
+        self.cfg.account_photo.clear();
         forget_login();
         self.remote.clear();
         self.cfg.remote.clear();
         self.remote_cache.clear();
+        liked_cache_clear();
+        self.liked_ids.clear();
         self.cfg.save();
         if self.view == View::Liked {
             self.tracks.clear();
@@ -932,10 +1274,6 @@ impl Rustym {
         });
     }
 
-    fn start(&mut self, ctx: &egui::Context, label: String, args: Vec<String>) {
-        self.start_chain(ctx, label, vec![args]);
-    }
-
     /// Fetches tracks from the YouTube Music API, falling back to yt-dlp (`chains`).
     fn start_api(&mut self, ctx: &egui::Context, label: String, mode: &'static str, arg: String, chains: Vec<Vec<String>>) {
         self.loading = true;
@@ -956,38 +1294,6 @@ impl Rustym {
         });
     }
 
-    fn start_chain(&mut self, ctx: &egui::Context, label: String, chains: Vec<Vec<String>>) {
-        self.loading = true;
-        self.status.clear();
-        self.label = label;
-        self.req += 1;
-        let id = self.req;
-        let tx = self.msg_tx.clone();
-        let ctx = ctx.clone();
-        std::thread::spawn(move || {
-            let m = match run_chain(chains) {
-                Ok(t) => Msg::Results(id, t),
-                Err(e) => Msg::Error(id, e),
-            };
-            let _ = tx.send(m);
-            ctx.request_repaint();
-        });
-    }
-
-    fn search(&mut self, ctx: &egui::Context) {
-        let q = self.query.trim().to_string();
-        if q.is_empty() {
-            return;
-        }
-        let args = vec![
-            "--flat-playlist".into(),
-            "--dump-json".into(),
-            "--no-warnings".into(),
-            format!("ytsearch30:{q}"),
-        ];
-        self.start(ctx, format!("Results for “{q}”"), args);
-    }
-
     fn load_liked(&mut self, ctx: &egui::Context) {
         if !self.cfg.signed_in {
             self.tracks.clear();
@@ -1006,6 +1312,12 @@ impl Rustym {
             mk("https://www.youtube.com/playlist?list=LL"),
         ];
         self.start_api(ctx, "Liked songs".into(), "liked", String::new(), chains);
+        // Saved copy first: the page opens instantly (and works offline); the fetch above then
+        // refreshes it silently and updates the saved copy.
+        let saved = liked_cache_load();
+        if !saved.is_empty() {
+            self.tracks = saved;
+        }
     }
 
     fn start_login(&mut self, ctx: &egui::Context) {
@@ -1016,8 +1328,11 @@ impl Rustym {
         self.login_msg.clear();
         let cancel = Arc::new(AtomicBool::new(false));
         self.login_cancel = cancel.clone();
-        let browser = self.cfg.browser.clone();
-        open_login(&browser);
+        if let Err(e) = open_login() {
+            self.login_waiting = false;
+            self.login_msg = e;
+            return;
+        }
         let tx = self.msg_tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
@@ -1027,8 +1342,8 @@ impl Rustym {
                 let _ = tp.send(Msg::LoginProgress(t));
                 cp.request_repaint();
             };
-            let m = match wait_for_login(&browser, &cancel, &progress) {
-                Ok(b) => Msg::LoginOk(Some(b)),
+            let m = match wait_for_login(&cancel, &progress) {
+                Ok(()) => Msg::LoginOk(None),
                 Err(e) => Msg::LoginFail(e),
             };
             let _ = tx.send(m);
@@ -1058,6 +1373,29 @@ impl Rustym {
                 self.tracks.clear();
                 self.load_liked(ctx);
             }
+            View::Albums => {
+                self.label = "Albums".into();
+                if self.lib_albums.is_empty() {
+                    self.fetch_cards(ctx, 0);
+                }
+            }
+            View::Artists => {
+                self.label = "Artists".into();
+                if self.lib_artists.is_empty() {
+                    self.fetch_cards(ctx, 1);
+                }
+            }
+            View::History => {
+                self.label = "History".into();
+                self.fetch_history(ctx);
+            }
+            View::Stats => self.label = "Listening stats".into(),
+            View::Local => {
+                self.label = "Local files".into();
+                if self.local_tracks.is_empty() {
+                    self.scan_local(ctx);
+                }
+            }
             View::Logs => {
                 self.label = "Debug logs".into();
                 if health_snapshot().is_empty() && !health_busy() {
@@ -1065,15 +1403,6 @@ impl Rustym {
                 }
             }
             _ => {}
-        }
-    }
-
-    fn hide(&mut self, ctx: &egui::Context) {
-        self.win.hidden.store(true, SeqCst);
-        if is_hypr() {
-            hide_window();
-        } else {
-            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
         }
     }
 
@@ -1093,6 +1422,10 @@ impl Rustym {
                             self.remote_cache.insert(r.id.clone(), t.clone());
                         }
                     }
+                    if self.view == View::Liked {
+                        self.liked_ids = t.iter().map(|x| x.id.clone()).collect();
+                        liked_cache_save(&t);
+                    }
                     self.tracks = t;
                 }
                 Msg::Error(id, e) => {
@@ -1101,12 +1434,17 @@ impl Rustym {
                         continue;
                     }
                     self.loading = false;
-                    self.tracks.clear();
-                    self.status = if self.view == View::Liked {
-                        format!("Couldn’t load liked songs ({e}). Try signing out and in again, and keep yt-dlp up to date (sudo pacman -Syu yt-dlp).")
+                    if self.view == View::Liked && !self.tracks.is_empty() {
+                        // keep the saved copy on screen instead of an empty page
+                        self.status = "Couldn’t refresh liked songs right now, so this is your saved copy.".into();
                     } else {
-                        e
-                    };
+                        self.tracks.clear();
+                        self.status = if self.view == View::Liked {
+                            format!("Couldn’t load liked songs ({e}). Try signing out and in again, and keep yt-dlp up to date (run: yt-dlp -U, or update it with your package manager).")
+                        } else {
+                            e
+                        };
+                    }
                 }
                 Msg::Trending(t) => {
                     self.trending_loading = false;
@@ -1133,14 +1471,15 @@ impl Rustym {
                 Msg::LoginOk(b) => {
                     self.login_waiting = false;
                     self.login_msg.clear();
-                    if let Some(b) = b {
-                        self.cfg.browser = b;
-                    }
+                    let _ = b;
                     self.cfg.signed_in = true;
                     self.cfg.save();
                     self.mix_cache.clear();
                     self.remote_err.clear();
                     self.fetch_remote(ctx);
+                    self.fetch_home(ctx);
+                    self.fetch_liked_ids(ctx);
+                    self.fetch_account(ctx);
                     if self.view == View::Liked {
                         self.load_liked(ctx);
                     }
@@ -1149,6 +1488,108 @@ impl Rustym {
                     if self.login_waiting {
                         self.login_msg = t;
                     }
+                }
+                Msg::Home(v) => {
+                    self.home_loading = false;
+                    self.shelves = v;
+                }
+                Msg::HomeErr(e) => {
+                    self.home_loading = false;
+                    log(1, "home", &e);
+                }
+                Msg::SearchRes(id, o) => {
+                    if id == self.req {
+                        self.loading = false;
+                        self.tracks = o.songs.clone();
+                        self.sres = o;
+                    }
+                }
+                Msg::Suggest(id, v) => {
+                    if id == self.sug_req {
+                        self.suggestions = v;
+                    }
+                }
+                Msg::Detail(id, d) => {
+                    if id == self.req {
+                        self.loading = false;
+                        self.label = d.title.clone();
+                        self.tracks = d.tracks.clone();
+                        self.detail = Some(d);
+                    }
+                }
+                Msg::DetailErr(id, e) => {
+                    log(2, "detail", &e);
+                    if id == self.req {
+                        self.loading = false;
+                        self.status = e;
+                    }
+                }
+                Msg::Cards(k, v) => {
+                    self.lib_loading = false;
+                    if k == 0 {
+                        self.lib_albums = v;
+                    } else {
+                        self.lib_artists = v;
+                    }
+                }
+                Msg::CardsErr(kind, e) => {
+                    self.lib_loading = false;
+                    log(2, "library", &e);
+                    let section = if kind == 0 { "Albums" } else { "Artists" };
+                    self.lib_err = format!("{section}: {e}");
+                }
+                Msg::History(h) => {
+                    self.hist_loading = false;
+                    self.history = h;
+                }
+                Msg::HistoryErr(e) => {
+                    self.hist_loading = false;
+                    log(1, "history", &e);
+                    self.hist_err = e;
+                }
+                Msg::Lyrics(id, l) => {
+                    if id == self.lyrics_for {
+                        self.lyrics_loading = false;
+                        self.lyrics = Some(l);
+                    }
+                }
+                Msg::LyricsErr(id, e) => {
+                    if id == self.lyrics_for {
+                        self.lyrics_loading = false;
+                        self.lyrics_err = e;
+                    }
+                }
+                Msg::LikedIds(v) => self.liked_ids = v.into_iter().collect(),
+                Msg::Account(n, ph) => {
+                    if !self.cfg.signed_in {
+                        continue;
+                    }
+                    if !n.is_empty() {
+                        self.cfg.account_name = n;
+                    }
+                    if !ph.is_empty() {
+                        self.cfg.account_photo = ph;
+                    }
+                    self.cfg.save();
+                }
+                Msg::Toast(t) => self.toast = Some((t, Instant::now())),
+                Msg::PlayNow(v) => {
+                    if let Some(t) = v.first().cloned() {
+                        self.record_recent(t);
+                        let _ = self.cmd.send(Cmd::Play(v, 0));
+                        self.go_now();
+                    }
+                }
+                Msg::Local(v) => {
+                    self.loading = false;
+                    if self.view == View::Local {
+                        self.tracks = v.clone();
+                    }
+                    self.local_tracks = v;
+                }
+                Msg::LibraryChanged => {
+                    self.remote_loading = false;
+                    self.fetch_remote(ctx);
                 }
                 Msg::LoginFail(e) => {
                     self.login_waiting = false;
@@ -1180,6 +1621,13 @@ impl Rustym {
         }
     }
 
+    fn go_now(&mut self) {
+        self.view = View::Now;
+        self.label = "Now playing".into();
+        self.status.clear();
+        self.back.clear();
+    }
+
     fn handle_act(&mut self, act: Option<Act>, src: Option<usize>) {
         if act.is_none() {
             return;
@@ -1194,8 +1642,43 @@ impl Rustym {
                     self.record_recent(t);
                 }
                 let _ = self.cmd.send(Cmd::Play(list, i));
+                self.go_now();
             }
             Some(Act::Add(i)) => self.adding = list.get(i).cloned(),
+            Some(Act::PlayNext(i)) => {
+                if let Some(t) = list.get(i).cloned() {
+                    let _ = self.cmd.send(Cmd::PlayNext(vec![t]));
+                    self.toast = Some(("Will play next".into(), Instant::now()));
+                }
+            }
+            Some(Act::Enqueue(i)) => {
+                if let Some(t) = list.get(i).cloned() {
+                    let _ = self.cmd.send(Cmd::Enqueue(vec![t]));
+                    self.toast = Some(("Added to queue".into(), Instant::now()));
+                }
+            }
+            Some(Act::Like(i)) => {
+                if let Some(t) = list.get(i).cloned() {
+                    self.toggle_like(&t);
+                }
+            }
+            Some(Act::Radio(i)) => {
+                if let Some(t) = list.get(i).cloned() {
+                    self.start_radio(&t.id);
+                }
+            }
+            Some(Act::ToArtist(i)) => {
+                if let Some(t) = list.get(i) {
+                    let id = t.artist_id.clone();
+                    self.open_detail_later = Some((ytm::Kind::Artist, id));
+                }
+            }
+            Some(Act::ToAlbum(i)) => {
+                if let Some(t) = list.get(i) {
+                    let id = t.album_id.clone();
+                    self.open_detail_later = Some((ytm::Kind::Album, id));
+                }
+            }
             Some(Act::Remove(i)) => {
                 if let Some(p) = src {
                     if let Some(pl) = self.cfg.playlists.get_mut(p) {
@@ -1204,6 +1687,8 @@ impl Rustym {
                         }
                     }
                     self.cfg.save();
+                } else if self.yt_removable() {
+                    self.remove_from_yt(i);
                 }
             }
             None => {}
@@ -1243,40 +1728,59 @@ impl Rustym {
                     ui.label(RichText::new("Rustym").size(22.0).strong().color(th.text));
                 });
                 ui.add_space(22.0);
-                let items: [(&str, View, Glyph); 7] = [
+                let items: [(&str, View, Glyph); 12] = [
                     ("Home", View::Home, Glyph::Home),
                     ("Search", View::Search, Glyph::Search),
                     ("Liked songs", View::Liked, Glyph::Heart),
-                    ("Now playing", View::Now, Glyph::Wave),
+                    ("Albums", View::Albums, Glyph::List),
+                    ("Artists", View::Artists, Glyph::List),
                     ("Playlists", View::Playlists, Glyph::List),
+                    ("History", View::History, Glyph::Wave),
+                    ("Local files", View::Local, Glyph::List),
+                    ("Stats", View::Stats, Glyph::Wave),
+                    ("Now playing", View::Now, Glyph::Wave),
                     ("Settings", View::Settings, Glyph::Gear),
                     ("Debug logs", View::Logs, Glyph::List),
                 ];
-                for (name, v, g) in items {
-                    let active = match (self.view, v) {
-                        (View::Playlist(_), View::Playlists) => true,
-                        (View::Mix(_), View::Home) => true,
-                        (View::Remote(_), View::Playlists) => true,
-                        (a, b) => a == b,
-                    };
-                    if nav_item(ui, th, g, name, active).clicked() {
-                        self.go(ctx, v);
+                let nav_h = (ui.available_height() - 120.0).max(120.0);
+                egui::ScrollArea::vertical().max_height(nav_h).auto_shrink([false, true]).show(ui, |ui| {
+                    for (name, v, g) in items {
+                        let active = match (self.view, v) {
+                            (View::Playlist(_), View::Playlists) => true,
+                            (View::Mix(_), View::Home) => true,
+                            (View::Remote(_), View::Playlists) => true,
+                            (a, b) => a == b,
+                        };
+                        if nav_item(ui, th, g, name, active).clicked() {
+                            self.back.clear();
+                            self.go(ctx, v);
+                        }
                     }
-                }
+                });
 
                 ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
                     if self.cfg.signed_in {
                         if ui.add(egui::Button::new(RichText::new("Sign out").size(12.0).color(th.dim)).frame(false)).clicked() {
                             self.sign_out();
                         }
-                        ui.label(RichText::new("● Signed in").size(13.0).color(th.accent));
+                        ui.add_space(8.0);
+                        let w = ui.available_width();
+                        ui.allocate_ui_with_layout(Vec2::new(w, 40.0), Layout::left_to_right(Align::Center), |ui| {
+                            account_avatar(ui, th, &self.cfg.account_photo, &self.cfg.account_name, 34.0);
+                            let nm = if self.cfg.account_name.is_empty() { "Signed in".to_string() } else { short_name(&self.cfg.account_name, 16) };
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 1.0;
+                                ui.label(RichText::new(nm).size(13.5).strong().color(th.text));
+                                ui.label(RichText::new("● Google account").size(11.0).color(th.accent));
+                            });
+                        });
                     } else if self.login_waiting {
                         if ui.add(egui::Button::new(RichText::new("Cancel").size(12.0).color(th.dim)).frame(false)).clicked() {
                             self.cancel_login();
                         }
                         ui.horizontal(|ui| {
                             spin(ui, th);
-                            ui.label(RichText::new("Finish signing in in your browser…").size(12.0).color(th.dim));
+                            ui.label(RichText::new("Finish signing in in the Rustym window…").size(12.0).color(th.dim));
                         });
                         if !self.login_msg.is_empty() {
                             ui.label(RichText::new(&self.login_msg).size(10.5).color(th.dim));
@@ -1311,7 +1815,7 @@ impl Rustym {
                     let cur = self.snap.current.clone();
                     cols[0].horizontal(|ui| match &cur {
                         Some(t) => {
-                            let (r, rr) = ui.allocate_exact_size(Vec2::new(96.0, 54.0), Sense::click());
+                            let (r, rr) = ui.allocate_exact_size(Vec2::new(54.0, 54.0), Sense::click());
                             thumb(ui, &t.id, r, 8.0);
                             if rr.clicked() {
                                 self.view = View::Now;
@@ -1335,9 +1839,16 @@ impl Rustym {
                     });
 
                     let ui = &mut cols[1];
-                    ui.horizontal(|ui| {
-                        ui.add_space(((ui.available_width() - 130.0) / 2.0).max(0.0));
+                    let row_w = ui.available_width();
+                    ui.allocate_ui_with_layout(Vec2::new(row_w, 40.0), Layout::left_to_right(Align::Center), |ui| {
+                        ui.add_space(((ui.available_width() - 450.0) / 2.0).max(0.0));
                         ui.spacing_mut().item_spacing.x = 14.0;
+                        if self.pill(ui, "Shuffle", self.snap.shuffle).clicked() {
+                            let on = !self.snap.shuffle;
+                            self.cfg.shuffle = on;
+                            self.cfg.save();
+                            let _ = self.cmd.send(Cmd::Shuffle(on));
+                        }
                         if icon_btn(ui, th, Icon::Prev, 30.0, false).clicked() {
                             let _ = self.cmd.send(Cmd::Prev);
                         }
@@ -1347,6 +1858,42 @@ impl Rustym {
                         }
                         if icon_btn(ui, th, Icon::Next, 30.0, false).clicked() {
                             let _ = self.cmd.send(Cmd::Next);
+                        }
+                        let rl = match self.snap.repeat {
+                            Repeat::Off => "Repeat",
+                            Repeat::All => "Repeat all",
+                            Repeat::One => "Repeat one",
+                        };
+                        if self.pill(ui, rl, self.snap.repeat != Repeat::Off).clicked() {
+                            let r = match self.snap.repeat {
+                                Repeat::Off => Repeat::All,
+                                Repeat::All => Repeat::One,
+                                Repeat::One => Repeat::Off,
+                            };
+                            self.cfg.repeat = r;
+                            self.cfg.save();
+                            let _ = self.cmd.send(Cmd::SetRepeat(r));
+                        }
+                        // sound modes, kept apart from the transport buttons
+                        ui.add_space(22.0);
+                        let bass_on = self.cfg.fx.eq_on && self.cfg.fx.eq == BASS_EQ;
+                        let mut fx = self.cfg.fx.clone();
+                        if self.pill(ui, "8D", self.cfg.fx.eight_d).clicked() {
+                            fx.eight_d = !fx.eight_d;
+                        }
+                        if self.pill(ui, "Bass", bass_on).clicked() {
+                            if bass_on {
+                                fx.eq_on = false;
+                                fx.eq = [0.0; 10];
+                            } else {
+                                fx.eq_on = true;
+                                fx.eq = BASS_EQ;
+                            }
+                        }
+                        if fx != self.cfg.fx {
+                            self.cfg.fx = fx.clone();
+                            let _ = self.cmd.send(Cmd::SetFx(fx));
+                            self.cfg.save();
                         }
                     });
                     ui.horizontal(|ui| {
@@ -1370,19 +1917,47 @@ impl Rustym {
                         ui.label(RichText::new(fmt_time(dur)).size(12.0).color(th.dim));
                     });
 
-                    cols[2].with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let resp = bar(ui, th, self.cfg.volume / 100.0, 110.0);
-                        if resp.dragged() || resp.clicked() {
-                            if let Some(p) = resp.interact_pointer_pos() {
-                                let f = ((p.x - resp.rect.left()) / resp.rect.width()).clamp(0.0, 1.0);
-                                self.cfg.volume = f * 100.0;
-                                let _ = self.cmd.send(Cmd::Volume(self.cfg.volume));
+                    cols[2].with_layout(Layout::top_down(Align::Max), |ui| {
+                        ui.add_space(8.0);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let resp = bar(ui, th, self.cfg.volume / 100.0, 110.0);
+                            if resp.dragged() || resp.clicked() {
+                                if let Some(p) = resp.interact_pointer_pos() {
+                                    let f = ((p.x - resp.rect.left()) / resp.rect.width()).clamp(0.0, 1.0);
+                                    self.cfg.volume = f * 100.0;
+                                    let _ = self.cmd.send(Cmd::Volume(self.cfg.volume));
+                                }
                             }
-                        }
-                        if resp.drag_stopped() || resp.clicked() {
-                            self.cfg.save();
-                        }
-                        ui.label(RichText::new("Vol").size(12.0).color(th.dim));
+                            if resp.drag_stopped() || resp.clicked() {
+                                self.cfg.save();
+                            }
+                            ui.label(RichText::new("Vol").size(12.0).color(th.dim));
+                            ui.add_space(8.0);
+                            if self.pill(ui, "Sound", self.fx_open || self.snap.sleep_left.is_some() || self.snap.sleep_eot).clicked() {
+                                self.fx_open = !self.fx_open;
+                            }
+                            if self.pill(ui, "Queue", self.show_queue).clicked() {
+                                self.show_queue = !self.show_queue;
+                            }
+                            let cur_id = self.snap.current.as_ref().map(|c| c.id.clone()).unwrap_or_default();
+                            let lyrics_shown = !cur_id.is_empty() && self.lyrics_enabled;
+                            if self.pill(ui, "Lyrics", lyrics_shown).clicked() {
+                                self.lyrics_enabled = !self.lyrics_enabled;
+                                self.cfg.auto_show_lyrics = self.lyrics_enabled;
+                                self.cfg.save();
+                                if self.lyrics_enabled && self.view != View::Now {
+                                    self.go(ui.ctx(), View::Now);
+                                }
+                            }
+                            if let Some(t) = self.snap.current.clone() {
+                                if t.local.is_empty() {
+                                    let liked = self.liked_ids.contains(&t.id);
+                                    if self.pill(ui, if liked { "Liked" } else { "Like" }, liked).clicked() {
+                                        self.toggle_like(&t);
+                                    }
+                                }
+                            }
+                        });
                     });
                 });
             });
@@ -1421,8 +1996,13 @@ impl Rustym {
         let mut goto: Option<View> = None;
         let mut login = false;
         let mut retry = false;
+        let mut open_card: Option<ytm::Card> = None;
         let time = ui.input(|i| i.time) as f32;
         let loading_shimmer = self.trending.is_empty() && self.trending_loading;
+        let greet = match self.cfg.account_name.split_whitespace().next() {
+            Some(n) if self.cfg.signed_in => format!("{}, {}", self.greeting, n),
+            _ => self.greeting.clone(),
+        };
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             // ---- hero ----
             let hero_h = 176.0;
@@ -1435,7 +2015,7 @@ impl Rustym {
             p.text(
                 Pos2::new(rect.left() + 32.0, rect.top() + 44.0),
                 Align2::LEFT_CENTER,
-                &self.greeting,
+                &greet,
                 FontId::proportional(34.0),
                 Color32::WHITE,
             );
@@ -1463,6 +2043,22 @@ impl Rustym {
                 }
             }
 
+            // ---- YouTube Music home shelves ----
+            for (si, shelf) in self.shelves.iter().enumerate().take(8) {
+                section(ui, th, &shelf.title, "");
+                ui.push_id(("shelf", si), |ui| {
+                    egui::ScrollArea::horizontal().auto_shrink([false, true]).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for c in shelf.cards.iter().take(14) {
+                                if pages::media_card(ui, th, c, 150.0).clicked() {
+                                    open_card = Some(c.clone());
+                                }
+                            }
+                        });
+                    });
+                });
+            }
+
             // ---- jump back in ----
             if !self.cfg.recent.is_empty() {
                 section(ui, th, "Jump back in", "Pick up where you left off");
@@ -1480,7 +2076,7 @@ impl Rustym {
             if loading_shimmer {
                 let a = 0.5 + 0.5 * (time * 3.0).sin();
                 grid(ui, 4, 190.0, |ui, _i, w| {
-                    let h = ((w - 20.0) * 9.0 / 16.0).floor() + 70.0;
+                    let h = (w - 20.0).floor() + 70.0;
                     let (r, _) = ui.allocate_exact_size(Vec2::new(w, h), Sense::hover());
                     ui.painter().rect_filled(r, 14.0, lerp_col(th.card, th.card2, a));
                 });
@@ -1551,11 +2147,15 @@ impl Rustym {
             ui.add_space(30.0);
         });
 
+        if let Some(c) = open_card {
+            self.open_card(ctx, c);
+        }
         if let Some((q, i)) = play {
             if let Some(t) = q.get(i).cloned() {
                 self.record_recent(t);
             }
             let _ = self.cmd.send(Cmd::Play(q, i));
+            self.go_now();
         }
         if let Some(i) = open_mix {
             self.open_mix(ctx, i);
@@ -1619,12 +2219,13 @@ impl Rustym {
         }
         if play && !self.tracks.is_empty() {
             let _ = self.cmd.send(Cmd::Play(self.tracks.clone(), 0));
+            self.go_now();
         }
         if self.tracks.is_empty() {
             return;
         }
         let cur = self.snap.current.as_ref().map(|c| c.id.clone());
-        let act = draw_tracks(ui, th, &self.tracks, cur.as_deref(), false);
+        let act = draw_tracks(ui, th, &self.tracks, cur.as_deref(), self.yt_removable(), &self.liked_ids);
         self.handle_act(act, None);
     }
 
@@ -1669,73 +2270,13 @@ impl Rustym {
         }
         if play && !self.tracks.is_empty() {
             let _ = self.cmd.send(Cmd::Play(self.tracks.clone(), 0));
+            self.go_now();
         }
         if self.tracks.is_empty() {
             return;
         }
         let cur = self.snap.current.as_ref().map(|c| c.id.clone());
-        let act = draw_tracks(ui, th, &self.tracks, cur.as_deref(), false);
-        self.handle_act(act, None);
-    }
-
-    fn page_search(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let th = self.theme;
-        let mut go = false;
-        ui.horizontal(|ui| {
-            let w = ui.available_width() - 96.0;
-            let resp = ui
-                .scope(|ui| {
-                    ui.spacing_mut().interact_size.y = 40.0;
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.query)
-                            .hint_text("Search songs, artists…")
-                            .font(FontId::proportional(16.0))
-                            .desired_width(w),
-                    )
-                })
-                .inner;
-            if self.focus_once {
-                resp.request_focus();
-                self.focus_once = false;
-            }
-            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                go = true;
-            }
-            if ui.add_sized([80.0, 40.0], accent_button(th, "Search")).clicked() {
-                go = true;
-            }
-        });
-        if go {
-            self.search(ctx);
-        }
-        ui.add_space(18.0);
-        self.header(ui);
-        if self.tracks.is_empty() {
-            if !self.loading && self.status.is_empty() {
-                self.empty(ui, "Search for a song to get started", "No ads. Just music.");
-                ui.add_space(24.0);
-                let mut pick: Option<&str> = None;
-                ui.vertical_centered(|ui| {
-                    ui.label(RichText::new("Try searching for").size(13.0).color(th.dim));
-                    ui.add_space(6.0);
-                    ui.horizontal_wrapped(|ui| {
-                        for s in ["Arijit Singh", "Anirudh Ravichander", "A. R. Rahman", "Lo-fi beats", "Taylor Swift", "The Weeknd", "Ilaiyaraaja", "Coke Studio"] {
-                            let b = egui::Button::new(RichText::new(s).size(14.0)).rounding(18.0).min_size(Vec2::new(0.0, 34.0));
-                            if ui.add(b).clicked() {
-                                pick = Some(s);
-                            }
-                        }
-                    });
-                });
-                if let Some(s) = pick {
-                    self.query = s.to_string();
-                    self.search(ctx);
-                }
-            }
-            return;
-        }
-        let cur = self.snap.current.as_ref().map(|c| c.id.clone());
-        let act = draw_tracks(ui, th, &self.tracks, cur.as_deref(), false);
+        let act = draw_tracks(ui, th, &self.tracks, cur.as_deref(), self.yt_removable(), &self.liked_ids);
         self.handle_act(act, None);
     }
 
@@ -1746,13 +2287,7 @@ impl Rustym {
                 ui.add_space(110.0);
                 ui.label(RichText::new("Sign in to see your liked songs").size(22.0).strong().color(th.text));
                 ui.add_space(6.0);
-                ui.label(
-                    RichText::new(format!(
-                        "Rustym opens Google sign-in in {} and detects it automatically.",
-                        self.cfg.browser
-                    ))
-                    .color(th.dim),
-                );
+                ui.label(RichText::new("Rustym opens its own Google sign-in window and detects it automatically.").color(th.dim));
                 ui.add_space(18.0);
                 if self.login_waiting {
                     spin(ui, th);
@@ -1785,36 +2320,8 @@ impl Rustym {
             return;
         }
         let cur = self.snap.current.as_ref().map(|c| c.id.clone());
-        let act = draw_tracks(ui, th, &self.tracks, cur.as_deref(), false);
+        let act = draw_tracks(ui, th, &self.tracks, cur.as_deref(), self.yt_removable(), &self.liked_ids);
         self.handle_act(act, None);
-    }
-
-    fn page_now(&mut self, ui: &mut egui::Ui) {
-        let th = self.theme;
-        let Some(t) = self.snap.current.clone() else {
-            self.empty(ui, "Nothing playing yet", "Pick a song from Search, Liked songs or a playlist.");
-            return;
-        };
-        let style = self.cfg.viz;
-        ui.vertical_centered(|ui| {
-            ui.add_space(4.0);
-            let w = (ui.available_width() * 0.55).min(500.0);
-            let (r, _) = ui.allocate_exact_size(Vec2::new(w, w * 9.0 / 16.0), Sense::hover());
-            ui.painter().rect_filled(r.expand(8.0), 20.0, th.accent.gamma_multiply(0.16));
-            thumb(ui, &t.id, r, 14.0);
-            ui.add_space(18.0);
-            ui.label(RichText::new(&t.title).size(26.0).strong().color(th.text));
-            ui.label(RichText::new(&t.artist).size(16.0).color(th.dim));
-            ui.add_space(14.0);
-            let vw = ui.available_width().min(820.0);
-            let vh = if style == 2 { 280.0 } else { 150.0 };
-            let resp = draw_viz(ui, th, &self.disp, style, Vec2::new(vw, vh));
-            if resp.clicked() {
-                self.cfg.viz = (self.cfg.viz + 1) % 3;
-                self.cfg.save();
-            }
-            ui.label(RichText::new("click the visualiser to change style").size(11.0).color(th.dim));
-        });
     }
 
     fn page_playlists(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -1955,13 +2462,14 @@ impl Rustym {
         if play_all {
             let q = self.cfg.playlists[i].tracks.clone();
             let _ = self.cmd.send(Cmd::Play(q, 0));
+            self.go_now();
         }
         if count == 0 {
             self.empty(ui, "This playlist is empty", "Use the + button on any song to add it here.");
             return;
         }
         let cur = self.snap.current.as_ref().map(|c| c.id.clone());
-        let act = draw_tracks(ui, th, &self.cfg.playlists[i].tracks, cur.as_deref(), true);
+        let act = draw_tracks(ui, th, &self.cfg.playlists[i].tracks, cur.as_deref(), true, &self.liked_ids);
         self.handle_act(act, Some(i));
     }
 
@@ -2130,27 +2638,37 @@ impl Rustym {
             });
 
             ui.add_space(22.0);
-            ui.label(RichText::new("Browser used for Google sign-in").size(16.0).strong().color(th.text));
-            ui.label(RichText::new("The browser you sign in with. Rustym reads its login to load liked songs.").size(12.0).color(th.dim));
+            ui.label(RichText::new("Interface & accessibility").size(16.0).strong().color(th.text));
             ui.add_space(6.0);
-            let before = self.cfg.browser.clone();
-            ui.horizontal_wrapped(|ui| {
-                for b in BROWSERS {
-                    ui.selectable_value(&mut self.cfg.browser, b.to_string(), b);
+            ui.horizontal(|ui| {
+                ui.label("Interface scale");
+                let scale = ui.add(egui::Slider::new(&mut self.cfg.ui_scale, 80.0..=125.0).suffix("%").show_value(true));
+                if scale.changed() {
+                    ctx.set_zoom_factor((self.cfg.ui_scale / 100.0).clamp(0.80, 1.25));
+                    self.cfg.save();
                 }
             });
-            if self.cfg.browser != before {
-                self.cfg.signed_in = false;
-                forget_login();
+            if ui.checkbox(&mut self.cfg.compact_mode, "Compact layout (tighter spacing and controls)").changed() {
                 self.cfg.save();
             }
+            if ui.checkbox(&mut self.cfg.auto_show_lyrics, "Keep Lyrics enabled when Rustym starts").changed() {
+                self.lyrics_enabled = self.cfg.auto_show_lyrics;
+                self.cfg.save();
+            }
+            ui.label(RichText::new("Scale and layout changes apply immediately and are saved for your next session. The Lyrics button also updates the startup preference.").size(12.0).color(th.dim));
 
             ui.add_space(22.0);
             ui.label(RichText::new("Account").size(16.0).strong().color(th.text));
             ui.add_space(6.0);
             if self.cfg.signed_in {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("● Signed in").color(th.accent));
+                    account_avatar(ui, th, &self.cfg.account_photo, &self.cfg.account_name, 44.0);
+                    ui.vertical(|ui| {
+                        let nm = if self.cfg.account_name.is_empty() { "Signed in to Google" } else { self.cfg.account_name.as_str() };
+                        ui.label(RichText::new(nm).size(15.0).strong().color(th.text));
+                        ui.label(RichText::new("● Signed in").size(12.0).color(th.accent));
+                    });
+                    ui.add_space(10.0);
                     if ui.button("Sign out").clicked() {
                         self.sign_out();
                     }
@@ -2176,23 +2694,95 @@ impl Rustym {
             if !self.login_msg.is_empty() {
                 ui.label(RichText::new(&self.login_msg).size(12.0).color(th.accent));
             }
-            ui.label(
-                RichText::new(format!(
-                    "Sign-in not picked up? Export your YouTube cookies (Netscape cookies.txt) to {} and press “Use cookies.txt”.",
-                    cookie_file().display()
-                ))
-                .size(12.0)
-                .color(th.dim),
-            );
+
+            ui.add_space(22.0);
+            ui.label(RichText::new("Playback").size(16.0).strong().color(th.text));
+            ui.add_space(6.0);
+            if ui.checkbox(&mut self.cfg.autoplay, "Autoplay: keep the queue going with YouTube Music radio").changed() {
+                let _ = self.cmd.send(Cmd::Autoplay(self.cfg.autoplay));
+                self.cfg.save();
+            }
+            ui.horizontal(|ui| {
+                ui.label("Lyrics timing");
+                if ui.add(egui::Slider::new(&mut self.cfg.lyrics_offset, -3000..=3000).suffix(" ms")).drag_stopped() {
+                    self.cfg.save();
+                }
+            });
+            ui.label(RichText::new("Tempo, pitch, equaliser, reverb, normalisation and the sleep timer are under “Sound” in the player bar.").size(12.0).color(th.dim));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Export local playlists").clicked() {
+                    self.export_playlists();
+                }
+                if ui.button("Import local playlists").clicked() {
+                    self.import_playlists();
+                }
+                if ui.button("Clear listening stats").clicked() {
+                    store::clear();
+                    self.toast = Some(("Listening stats cleared".into(), Instant::now()));
+                }
+            });
+            ui.label(RichText::new(format!("Export/import file: {}", config_dir().join("playlists-export.json").display())).size(12.0).color(th.dim));
 
             ui.add_space(22.0);
             ui.label(RichText::new("Window").size(16.0).strong().color(th.text));
             ui.add_space(6.0);
             if ui
-                .checkbox(&mut self.cfg.background, "Keep playing in the background when the window is closed (needs a system tray)")
+                .checkbox(&mut self.cfg.background, "Close to tray: closing the window keeps the music playing in the background")
                 .changed()
             {
                 self.cfg.save();
+            }
+            ui.label(
+                RichText::new("The window is really closed (not just hidden), on X11 and Wayland alike. The tray icon, launching Rustym again, or `rustym --show` brings it back.")
+                    .size(12.0)
+                    .color(th.dim),
+            );
+            if self.cfg.background {
+                let (txt, col) = if self.tray_ok {
+                    ("● Tray icon available".to_string(), th.dim)
+                } else {
+                    (
+                        format!(
+                            "● No system tray detected: the window still closes and music keeps playing; reopen it by launching Rustym again or running `rustym --show`. {}",
+                            distro::tray_advice()
+                        ),
+                        th.accent,
+                    )
+                };
+                ui.label(RichText::new(txt).size(12.0).color(col));
+            }
+            ui.label(RichText::new("Control from a terminal or keybindings: rustym --toggle | --play-pause | --next | --prev | --quit").size(12.0).color(th.dim));
+            ui.add_space(10.0);
+            if ui.checkbox(&mut self.cfg.start_minimised, "Start minimised (restore from the tray or task switcher)").changed() {
+                self.cfg.save();
+            }
+            let auto_before = self.cfg.start_at_login;
+            if ui.checkbox(&mut self.cfg.start_at_login, "Launch Rustym automatically when I sign in to this desktop").changed() {
+                match set_desktop_autostart(self.cfg.start_at_login) {
+                    Ok(()) => {
+                        self.cfg.save();
+                        self.toast = Some((if self.cfg.start_at_login { "Desktop auto-start enabled" } else { "Desktop auto-start disabled" }.into(), Instant::now()));
+                    }
+                    Err(e) => {
+                        self.cfg.start_at_login = auto_before;
+                        self.toast = Some((format!("Could not update auto-start: {e}"), Instant::now()));
+                    }
+                }
+            }
+            ui.label(RichText::new("Auto-start uses your desktop's XDG autostart entry. Start minimised takes effect the next time Rustym opens.").size(12.0).color(th.dim));
+
+            ui.add_space(22.0);
+            ui.label(RichText::new("Liked songs").size(16.0).strong().color(th.text));
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new("Your liked songs are saved on this computer, so the Liked page opens instantly and works offline. They refresh in the background every time you open it.")
+                    .size(12.0)
+                    .color(th.dim),
+            );
+            if ui.button("Clear saved liked songs").clicked() {
+                liked_cache_clear();
+                self.toast = Some(("Saved liked songs cleared".into(), Instant::now()));
             }
 
             ui.add_space(22.0);
@@ -2221,11 +2811,17 @@ impl Rustym {
                     View::Remote(i) => self.page_remote(ui, i),
                     View::Search => self.page_search(ui, ctx),
                     View::Liked => self.page_liked(ui, ctx),
-                    View::Now => self.page_now(ui),
+                    View::Now => self.page_now(ui, ctx),
                     View::Playlists => self.page_playlists(ui, ctx),
                     View::Playlist(i) => self.page_playlist(ui, i),
                     View::Settings => self.page_settings(ui, ctx),
                     View::Logs => self.page_logs(ui, ctx),
+                    View::Albums => self.page_cards(ui, ctx, 0),
+                    View::Artists => self.page_cards(ui, ctx, 1),
+                    View::History => self.page_history(ui, ctx),
+                    View::Stats => self.page_stats(ui, ctx),
+                    View::Local => self.page_local(ui, ctx),
+                    View::Detail => self.page_detail(ui, ctx),
                 }
             });
     }
@@ -2236,6 +2832,8 @@ impl Rustym {
         let mut close = false;
         let mut chosen: Option<usize> = None;
         let mut create = false;
+        let mut chosen_yt: Option<usize> = None;
+        let mut create_yt = false;
         egui::Window::new("Add to playlist")
             .collapsible(false)
             .resizable(false)
@@ -2249,6 +2847,17 @@ impl Rustym {
                         chosen = Some(i);
                     }
                 }
+                if self.cfg.signed_in && !self.remote.is_empty() && t.local.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("YouTube Music playlists").size(12.0).color(th.dim));
+                    egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                        for (i, r) in self.remote.iter().enumerate() {
+                            if ui.add_sized([ui.available_width(), 30.0], egui::Button::new(&r.title)).clicked() {
+                                chosen_yt = Some(i);
+                            }
+                        }
+                    });
+                }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     ui.add(egui::TextEdit::singleline(&mut self.new_pl).hint_text("New playlist…").desired_width(190.0));
@@ -2256,6 +2865,9 @@ impl Rustym {
                         create = true;
                     }
                 });
+                if self.cfg.signed_in && t.local.is_empty() && ui.button("Create as new YouTube Music playlist").clicked() {
+                    create_yt = true;
+                }
                 ui.add_space(6.0);
                 if ui.button("Cancel").clicked() {
                     close = true;
@@ -2267,7 +2879,17 @@ impl Rustym {
             chosen = Some(self.cfg.playlists.len() - 1);
         }
         if let Some(i) = chosen {
-            self.add_to_playlist(i, t);
+            self.add_to_playlist(i, t.clone());
+            close = true;
+        }
+        if let Some(i) = chosen_yt {
+            self.add_to_yt(i, t.clone());
+            close = true;
+        }
+        if create_yt && !self.new_pl.trim().is_empty() {
+            let name = self.new_pl.trim().to_string();
+            self.new_pl.clear();
+            self.create_yt_playlist(name, vec![t.id.clone()]);
             close = true;
         }
         if close {
@@ -2278,29 +2900,47 @@ impl Rustym {
 
 impl eframe::App for Rustym {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.win.want_show.swap(false, SeqCst) {
-            ctx.send_viewport_cmd(ViewportCommand::Visible(true));
-            ctx.send_viewport_cmd(ViewportCommand::Focus);
-        }
-        if self.win.want_hide.swap(false, SeqCst) {
-            ctx.send_viewport_cmd(ViewportCommand::Visible(false));
-        }
-        if ctx.input(|i| i.viewport().close_requested()) && self.cfg.background {
-            ctx.send_viewport_cmd(ViewportCommand::CancelClose);
-            self.hide(ctx);
-        }
-        if !ctx.wants_keyboard_input() && ctx.input(|i| i.key_pressed(egui::Key::Space)) {
-            let _ = self.cmd.send(Cmd::Toggle);
+        // Closing the window just ends this process; the background process keeps playing
+        // (or quits, when "close to tray" is off).
+        if self.view == View::Settings && self.tray_checked.elapsed() > Duration::from_secs(3) {
+            self.tray_ok = tray_host_running();
+            self.tray_checked = Instant::now();
         }
 
+        // Apply the saved interface preferences before laying out this frame.
+        ctx.set_zoom_factor((self.cfg.ui_scale / 100.0).clamp(0.80, 1.25));
+        ctx.style_mut(|style| {
+            style.spacing.item_spacing = if self.cfg.compact_mode { Vec2::new(7.0, 5.0) } else { Vec2::new(10.0, 8.0) };
+            style.spacing.button_padding = if self.cfg.compact_mode { Vec2::new(10.0, 5.0) } else { Vec2::new(14.0, 7.0) };
+        });
         self.pump(ctx);
         self.snap = self.shared.lock().unwrap().clone();
+        let current_id = self.snap.current.as_ref().map(|t| t.id.clone()).unwrap_or_default();
+        if !current_id.is_empty() && current_id != self.last_current_id {
+            self.last_current_id = current_id;
+            self.back.clear();
+            self.view = View::Now;
+            self.label = "Now playing".into();
+        }
+        // Minimise only once, after the first backend snapshot has arrived.
+        if self.startup_minimise_pending {
+            self.startup_minimise_pending = false;
+            if self.cfg.start_minimised {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            }
+        }
         self.update_levels();
 
+        self.housekeeping(ctx);
+        self.shortcuts(ctx);
         self.sidebar(ctx);
         self.player(ctx);
+        self.queue_panel(ctx);
         self.main_panel(ctx);
         self.add_modal(ctx);
+        self.fx_window(ctx);
+        self.help_window(ctx);
+        self.toast_draw(ctx);
 
         let playing = self.snap.playing && !self.snap.paused;
         let ms = if self.view == View::Now && playing {
@@ -2316,38 +2956,196 @@ impl eframe::App for Rustym {
 
 impl Drop for Rustym {
     fn drop(&mut self) {
+        // Only the window is going away. The engine lives in the background process.
         self.cfg.save();
-        let _ = self.cmd.send(Cmd::Quit);
-        std::thread::sleep(Duration::from_millis(200));
     }
 }
 
-fn main() {
-    if ping_existing() {
-        return;
-    }
-    std::panic::set_hook(Box::new(|info| {
-        log(2, "panic", format!("{info}"));
-        eprintln!("rustym panic: {info}");
-    }));
-    log(0, "app", format!("Rustym {} starting", env!("CARGO_PKG_VERSION")));
+const HELP: &str = "Rustym - ad-free YouTube Music player
+
+USAGE: rustym [OPTION]
+
+  (no option)     open the window (or raise the running one)
+  --background    start without a window (tray only)
+  --show          open / raise the window
+  --hide          close the window, keep playing in the background
+  --toggle        show if hidden, hide if shown
+  --play-pause    toggle playback of the running instance
+  --next, --prev  skip tracks in the running instance
+  --quit          quit the running instance
+  -V, --version   print the version
+
+The control options talk to the running instance, so they work from any shell,
+launcher or desktop keybinding on X11 and Wayland alike.";
+
+/// The window process: just the UI, connected to the background process that plays the music.
+fn run_gui() -> ! {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1180.0, 760.0])
             .with_min_inner_size([860.0, 520.0])
             .with_title("Rustym")
             .with_app_id("rustym"),
-        // With vsync on, Wayland blocks the whole UI thread in swap_buffers while the window is
-        // hidden / on another workspace, which makes Hyprland show "Application Not Responding".
+        // With vsync on, Wayland blocks the UI thread in swap_buffers while the window is
+        // hidden / on another workspace, which makes some compositors show "Application Not Responding".
         vsync: false,
         ..Default::default()
     };
     let r = eframe::run_native("Rustym", opts, Box::new(|cc| Ok(Box::new(Rustym::new(cc)))));
-    // The window is closed: stop mpv / parec / sockets and make sure the process really exits.
-    cleanup();
+    // Only the window ends here; the background process keeps the music going.
+    stop_viz();
     if let Err(e) = r {
         eprintln!("rustym: {e}");
+        log(2, "gui", format!("window error: {e}"));
         std::process::exit(1);
     }
+    std::process::exit(0);
+}
+
+/// Desktop launchers do not always put ~/.local/bin (pip / yt-dlp release binary) or ~/.deno/bin
+/// on PATH, even though a terminal does. Add them so mpv can always find yt-dlp and deno.
+fn extend_path() {
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else { return };
+    let mut dirs: Vec<std::path::PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    for extra in [home.join(".local/bin"), home.join(".deno/bin"), home.join(".cargo/bin"), "/usr/local/bin".into()] {
+        if extra.is_dir() && !dirs.contains(&extra) {
+            dirs.push(extra);
+        }
+    }
+    if let Ok(joined) = std::env::join_paths(dirs) {
+        std::env::set_var("PATH", joined);
+    }
+}
+
+fn main() {
+    extend_path();
+    let mut start_hidden = false;
+    let mut gui_mode = false;
+    for a in std::env::args().skip(1) {
+        match a.as_str() {
+            "-h" | "--help" => {
+                println!("{HELP}");
+                return;
+            }
+            "-V" | "--version" => {
+                println!("rustym {}", env!("CARGO_PKG_VERSION"));
+                return;
+            }
+            "--gui" => gui_mode = true, // internal: the window process
+            "--background" | "--hidden" => start_hidden = true,
+            "--show" | "--toggle" | "--hide" | "--play-pause" | "--next" | "--prev" | "--quit" => {
+                let word = a.trim_start_matches("--").replace('-', "");
+                if send_instance(&word) {
+                    return;
+                }
+                match a.as_str() {
+                    "--show" | "--toggle" => {} // not running: start it normally
+                    "--hide" | "--quit" => return,
+                    _ => {
+                        eprintln!("rustym is not running");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            other => {
+                eprintln!("rustym: unknown option {other} (try --help)");
+                std::process::exit(2);
+            }
+        }
+    }
+    if gui_mode {
+        run_gui();
+    }
+    // Single instance: a second launch asks the running one to open its window.
+    if start_hidden {
+        if send_instance("ping") {
+            return;
+        }
+    } else if send_instance("show") {
+        return;
+    }
+
+    std::panic::set_hook(Box::new(|info| {
+        log(2, "panic", format!("{info}"));
+        eprintln!("rustym panic: {info}");
+    }));
+    log(0, "app", format!("Rustym {} starting", env!("CARGO_PKG_VERSION")));
+
+    // ----- background process: engine + tray + media keys + control socket; windows are child processes -----
+    let cfg = Config::load();
+    let (cmd, shared) = spawn_engine(cfg.volume, Arc::new(|| {}));
+    let _ = cmd.send(Cmd::Shuffle(cfg.shuffle));
+    let _ = cmd.send(Cmd::SetRepeat(cfg.repeat));
+    let _ = cmd.send(Cmd::Autoplay(cfg.autoplay));
+    let _ = cmd.send(Cmd::SetFx(cfg.fx.clone()));
+    let win = Arc::new(WinCtl::new());
+    mpris::spawn(cmd.clone(), shared.clone(), win.clone());
+    spawn_tray(cmd.clone(), win.clone());
+    listen_instance(win.clone(), cmd.clone(), shared);
+
+    let started = Instant::now();
+    let mut first = true;
+    let mut child: Option<std::process::Child> = None;
+    loop {
+        // The window process ended (window closed)?
+        if let Some(c) = child.as_mut() {
+            if let Ok(Some(st)) = c.try_wait() {
+                child = None;
+                win.gui_open.store(false, SeqCst);
+                if Config::load().background {
+                    log(0, "app", format!("window closed ({st}); running in the background"));
+                    warn_no_tray();
+                } else {
+                    break; // close-to-tray is off: closing the window quits Rustym
+                }
+            }
+        }
+        // Hide request (tray / CLI / media-key raise toggle): end the window process, keep running.
+        if win.want_hide.swap(false, SeqCst) {
+            if let Some(mut c) = child.take() {
+                let _ = c.kill();
+                let _ = c.wait();
+                win.gui_open.store(false, SeqCst);
+            }
+        }
+        let mut open_now = win.want_show.swap(false, SeqCst);
+        if first {
+            if !start_hidden {
+                open_now = true;
+            } else if TRAY_UP.load(SeqCst) {
+                first = false; // the tray is there to restore the window: stay hidden
+            } else if started.elapsed() > Duration::from_secs(10) {
+                open_now = true; // no tray showed up: never leave the person with nothing
+            }
+        }
+        if open_now && child.is_none() {
+            first = false;
+            match spawn_gui() {
+                Ok(c) => {
+                    child = Some(c);
+                    win.gui_open.store(true, SeqCst);
+                }
+                Err(e) => {
+                    eprintln!("rustym: could not start the window process: {e}");
+                    log(2, "app", format!("could not start window process: {e}"));
+                    if start_hidden && !TRAY_UP.load(SeqCst) {
+                        break;
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+
+    if let Some(mut c) = child {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    // Quit: the engine stops mpv, removes its sockets and ends the process.
+    let _ = cmd.send(Cmd::Quit);
+    std::thread::sleep(Duration::from_millis(500));
+    cleanup();
     std::process::exit(0);
 }

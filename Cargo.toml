@@ -1,8 +1,8 @@
 [package]
 name = "rustym"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
-description = "Rustym - a simple, ad-free YouTube Music player for Linux"
+description = "Rustym - an ad-free, feature-rich YouTube Music player for Linux (pure Rust + egui)"
 
 [dependencies]
 eframe = "0.29"
@@ -11,6 +11,30 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ksni = "0.2.2"
+# native YouTube Music client + lyrics (blocking HTTP, rustls)
+ureq = { version = "2", features = ["json"] }
+sha1 = "0.10"
+rand = "0.8"
+# media keys / MPRIS "now playing" (disable with --no-default-features if it will not build)
+souvlaki = { version = "0.7", optional = true }
+
+# in-app Google sign-in window (needs webkit2gtk-4.1 + gtk3 installed); builds the `rustym-login` helper
+wry = { version = "0.47", optional = true }
+tao = { version = "0.30", optional = true }
+
+[features]
+default = ["mpris", "webview-login"]
+mpris = ["dep:souvlaki"]
+webview-login = ["dep:wry", "dep:tao"]
+
+[[bin]]
+name = "rustym"
+path = "src/main.rs"
+
+[[bin]]
+name = "rustym-login"
+path = "src/bin/rustym-login.rs"
+required-features = ["webview-login"]
 
 [profile.release]
 opt-level = 3
