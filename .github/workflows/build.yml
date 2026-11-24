@@ -59,9 +59,11 @@ jobs:
     runs-on: ubuntu-latest
     container: archlinux:base-devel
     steps:
-      - name: Install build dependencies
+      - name: Install build + runtime dependencies
         run: |
-          pacman -Syu --noconfirm --needed git rust webkit2gtk-4.1 gtk3 pkgconf
+          # makepkg checks the runtime deps too, so install them as well
+          pacman -Syu --noconfirm --needed git rust webkit2gtk-4.1 gtk3 pkgconf \
+            mpv yt-dlp ffmpeg noto-fonts xdg-utils
 
       - uses: actions/checkout@v4
 
