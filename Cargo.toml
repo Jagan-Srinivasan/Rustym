@@ -74,5 +74,5 @@ required-features = ["webview-login"]
 
 [profile.release]
 opt-level = 3
-lto = true
+lto = "thin"  # fat LTO breaks ring crate linking with the lld default linker (rustc >= 1.90)
 strip = true
