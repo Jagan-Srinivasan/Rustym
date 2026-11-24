@@ -2,6 +2,7 @@
 
 mod distro;
 mod engine;
+mod imgcache;
 mod local;
 mod lyrics;
 mod mpris;
@@ -14,6 +15,7 @@ use eframe::egui::{
     Pos2, Rect, RichText, Sense, Shape, Stroke, Vec2,
 };
 use engine::*;
+use eframe::egui::load::BytesLoader;
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -504,7 +506,14 @@ fn thumb(ui: &egui::Ui, id: &str, rect: Rect, radius: f32) {
     }
     // YouTube video thumbnails are 16:9. Crop the left/right edges so the
     // poster artwork fills this square tile instead of letterboxing/stretching.
-    egui::Image::new(ImageSource::Uri(format!("https://i.ytimg.com/vi/{id}/maxresdefault.jpg").into()))
+    // Size-appropriate variant: mqdefault (320x180, always exists) for small
+    // tiles and rows, maxresdefault only for the large Now Playing artwork.
+    // Together with the bounded image loader this keeps decoded thumbnails
+    // tiny; maxres was 1280x720 (~3.7 MB decoded) per tile and stayed cached
+    // forever.
+    let side = rect.width().max(rect.height());
+    let variant = if side <= 300.0 { "mqdefault.jpg" } else { "maxresdefault.jpg" };
+    egui::Image::new(ImageSource::Uri(format!("https://i.ytimg.com/vi/{id}/{variant}").into()))
         .uv(Rect::from_min_max(Pos2::new(0.21875, 0.0), Pos2::new(0.78125, 1.0)))
         .fit_to_exact_size(rect.size())
         .rounding(radius)
@@ -942,7 +951,7 @@ struct Rustym {
     theme: Theme,
     cmd: Sender<Cmd>,
     shared: Arc<Mutex<Shared>>,
-    viz: Arc<Mutex<VizData>>,
+    viz: Option<Arc<Mutex<VizData>>>,
     snap: Shared,
     query: String,
     label: String,
@@ -969,6 +978,12 @@ struct Rustym {
     adding: Option<Track>,
     disp: Vec<f32>,
     t0: Instant,
+    /// Bounded decoded-image cache (see imgcache.rs).
+    img: std::sync::Arc<imgcache::BoundedImageLoader>,
+    /// Last time the image-cache janitor ran.
+    img_t: Instant,
+    /// Cached logs page snapshot (avoids cloning the log vec every frame).
+    logs_cache: (Instant, std::sync::Arc<Vec<LogEntry>>),
     msg_tx: Sender<Msg>,
     msg_rx: Receiver<Msg>,
     // ---- v0.4 ----
@@ -1021,6 +1036,9 @@ impl Rustym {
         let cfg = Config::load();
         let theme = THEMES[cfg.theme.min(THEMES.len() - 1)];
         egui_extras::install_image_loaders(&cc.egui_ctx);
+        // Our bounded loader is tried first for decoded images (LRU + size-aware
+        // decode); egui_extras' loader stays installed as the fallback/bytes fetcher.
+        let img = imgcache::BoundedImageLoader::install(&cc.egui_ctx);
         setup_fonts(&cc.egui_ctx);
         apply_theme(&cc.egui_ctx, &theme);
         cc.egui_ctx.set_zoom_factor((cfg.ui_scale / 100.0).clamp(0.80, 1.25));
@@ -1030,7 +1048,8 @@ impl Rustym {
         // This is the window process. The engine, tray icon and media keys live in the background
         // process; the window just talks to it, so closing the window never interrupts playback.
         let (cmd, shared) = connect_backend(repaint.clone());
-        let viz = spawn_viz();
+        // Only capture audio (parec) when the visualiser is actually shown.
+        let viz = if cfg.show_visualiser { Some(spawn_viz()) } else { None };
 
         let (msg_tx, msg_rx) = channel();
         let trending = cfg.trending.clone();
@@ -1043,6 +1062,9 @@ impl Rustym {
             cmd,
             shared,
             viz,
+            img,
+            img_t: Instant::now(),
+            logs_cache: (Instant::now(), Arc::new(Vec::new())),
             snap: Shared::default(),
             query: String::new(),
             label: "Home".into(),
@@ -1604,16 +1626,28 @@ impl Rustym {
 
     fn update_levels(&mut self) {
         let playing = self.snap.playing && !self.snap.paused;
-        let target: Vec<f32> = {
-            let v = self.viz.lock().unwrap();
-            if v.live && v.updated.elapsed() < Duration::from_millis(1200) {
-                v.levels.clone()
-            } else if playing {
-                fake_levels(self.t0.elapsed().as_secs_f32())
-            } else {
-                vec![0.0; BANDS]
+        let target: Vec<f32> = match &self.viz {
+            Some(v) => {
+                let v = v.lock().unwrap();
+                if v.live && v.updated.elapsed() < Duration::from_millis(1200) {
+                    v.levels.clone()
+                } else if playing {
+                    fake_levels(self.t0.elapsed().as_secs_f32())
+                } else {
+                    vec![0.0; BANDS]
+                }
             }
+            // Visualiser is off: skip the capture thread entirely (no parec),
+            // only animate the fake bars while music is playing.
+            None if playing => fake_levels(self.t0.elapsed().as_secs_f32()),
+            None => Vec::new(),
         };
+        if target.is_empty() {
+            for d in self.disp.iter_mut() {
+                *d *= 0.88;
+            }
+            return;
+        }
         for i in 0..BANDS {
             let t = target[i];
             let d = &mut self.disp[i];
@@ -2479,7 +2513,12 @@ impl Rustym {
         let amber = Color32::from_rgb(255, 184, 76);
         let green = Color32::from_rgb(80, 210, 130);
         ctx.request_repaint_after(Duration::from_millis(500));
-        let logs = logs_snapshot();
+        // Snapshot the log at most once per second instead of cloning up to
+        // 1500 entries on every frame.
+        if self.logs_cache.0.elapsed() > Duration::from_secs(1) {
+            self.logs_cache = (Instant::now(), Arc::new(logs_snapshot()));
+        }
+        let logs = self.logs_cache.1.clone();
         let health = health_snapshot();
         let busy = health_busy();
         let n_err = logs.iter().filter(|e| e.level == 2).count();
@@ -2509,6 +2548,7 @@ impl Rustym {
                 }
                 if ui.button("Clear log").clicked() {
                     logs_clear();
+                    self.logs_cache = (Instant::now(), Arc::new(Vec::new()));
                 }
                 if busy {
                     spin(ui, th);
@@ -2905,6 +2945,32 @@ impl eframe::App for Rustym {
         if self.view == View::Settings && self.tray_checked.elapsed() > Duration::from_secs(3) {
             self.tray_ok = tray_host_running();
             self.tray_checked = Instant::now();
+        }
+
+        // Image-cache janitor: release decoded images, GPU textures and raw
+        // bytes for thumbnails that have not been drawn for a while.
+        if self.img_t.elapsed() > Duration::from_secs(15) {
+            self.img_t = Instant::now();
+            let stale = self.img.forget_stale();
+            if !stale.is_empty() {
+                let loaders = ctx.loaders();
+                for u in &stale {
+                    loaders.include.forget(u);
+                    for b in loaders.bytes.lock().iter() {
+                        b.forget(u);
+                    }
+                    for l in loaders.texture.lock().iter() {
+                        l.forget(u);
+                    }
+                }
+            }
+        }
+        // Visualiser lifecycle: run the audio capture only while shown.
+        if self.cfg.show_visualiser && self.viz.is_none() {
+            self.viz = Some(spawn_viz());
+        } else if !self.cfg.show_visualiser && self.viz.is_some() {
+            stop_viz();
+            self.viz = None;
         }
 
         // Apply the saved interface preferences before laying out this frame.

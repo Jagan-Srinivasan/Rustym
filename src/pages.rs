@@ -14,6 +14,56 @@ fn fmt_hms(secs: f64) -> String {
     }
 }
 
+/// Live status chip: a pulsing dot + label (Loading / Paused / Playing).
+fn status_chip(ui: &mut egui::Ui, th: Theme, loading: bool, paused: bool) {
+    let (text, dot, pulse) = if loading {
+        ("Loading", th.accent, true)
+    } else if paused {
+        ("Paused", th.dim, false)
+    } else {
+        ("Playing", th.accent, false)
+    };
+    egui::Frame::none()
+        .fill(th.panel)
+        .rounding(9.0)
+        .inner_margin(Margin::symmetric(9.0, 3.0))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let (rect, _) = ui.allocate_exact_size(Vec2::new(9.0, 9.0), Sense::hover());
+                let a = if pulse {
+                    let t = ui.input(|i| i.time);
+                    0.35 + 0.65 * (0.5 + 0.5 * (t as f32 * 3.0).sin())
+                } else {
+                    1.0
+                };
+                ui.painter().circle_filled(rect.center(), 3.2, dot.gamma_multiply(a));
+                ui.label(RichText::new(text).size(11.0).color(th.dim2));
+            });
+        });
+}
+
+/// Rounded album pill with a music note.
+fn album_chip(ui: &mut egui::Ui, th: Theme, album: &str) {
+    egui::Frame::none()
+        .fill(th.panel)
+        .rounding(10.0)
+        .inner_margin(Margin::symmetric(9.0, 4.0))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("♪").size(11.0).color(th.accent));
+                ui.label(RichText::new(album).size(12.0).color(th.dim2));
+            });
+        });
+}
+
+/// Artwork with a soft accent glow ring behind it.
+fn glow_art(ui: &mut egui::Ui, th: Theme, id: &str, art: Rect) {
+    let p = ui.painter();
+    p.rect_filled(art.expand(6.0), 22.0, th.accent.gamma_multiply(0.14));
+    p.rect_filled(art.expand(2.0), 20.0, th.accent.gamma_multiply(0.28));
+    thumb(ui, id, art, 18.0);
+}
+
 /// Album / artist / playlist / song tile with a square picture.
 pub fn media_card(ui: &mut egui::Ui, th: Theme, c: &ytm::Card, w: f32) -> egui::Response {
     let h = w + 50.0;
@@ -1220,14 +1270,22 @@ impl Rustym {
         };
 
         ui.add_space(8.0);
+
+        // ---- header: eyebrow, live status chip, view toggles ----
         ui.horizontal(|ui| {
             ui.label(RichText::new("NOW PLAYING").size(11.0).strong().color(th.accent));
-            ui.add_space(8.0);
-            ui.label(RichText::new(if self.snap.loading { "Preparing your track" } else if self.snap.paused { "Paused" } else { "Playing" }).size(12.0).color(th.dim));
+            ui.add_space(6.0);
+            status_chip(ui, th, self.snap.loading, self.snap.paused);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let label = if self.cfg.show_visualiser { "Hide visualiser" } else { "Show visualiser" };
-                if ui.add(egui::Button::new(RichText::new(label).size(11.0).color(th.accent)).fill(th.panel).rounding(9.0)).clicked() {
+                let viz_label = if self.cfg.show_visualiser { "◔  Visualiser" } else { "○  Visualiser" };
+                if ui.add(egui::Button::new(RichText::new(viz_label).size(11.0).color(th.accent)).fill(th.panel).rounding(9.0)).clicked() {
                     self.cfg.show_visualiser = !self.cfg.show_visualiser;
+                    self.cfg.save();
+                }
+                let lyr_label = if self.lyrics_enabled { "♫  Lyrics on" } else { "♫  Lyrics" };
+                if ui.add(egui::Button::new(RichText::new(lyr_label).size(11.0).color(if self.lyrics_enabled { th.text } else { th.accent })).fill(th.panel).rounding(9.0)).clicked() {
+                    self.lyrics_enabled = !self.lyrics_enabled;
+                    self.cfg.auto_show_lyrics = self.lyrics_enabled;
                     self.cfg.save();
                 }
             });
@@ -1245,7 +1303,7 @@ impl Rustym {
         // columns together instead of leaving a short row inside a tall card.
         let expanded_height = !self.cfg.show_visualiser;
         let card_content_height = if expanded_height {
-            (available_height - 62.0).max(300.0)
+            (available_height - 70.0).max(300.0)
         } else {
             0.0
         };
@@ -1277,6 +1335,11 @@ impl Rustym {
             .rounding(24.0)
             .inner_margin(Margin::same(20.0))
             .show(ui, |ui| {
+                // Ambient accent glow inside the card corners (paint only, no layout).
+                let p = ui.painter();
+                let r = ui.max_rect();
+                p.circle_filled(r.left_top() + Vec2::new(30.0, 30.0), 190.0, th.accent.gamma_multiply(0.055));
+                p.circle_filled(r.right_bottom() - Vec2::new(30.0, 30.0), 150.0, th.accent.gamma_multiply(0.045));
                 if card_min_height > 0.0 {
                     ui.set_min_height(card_min_height - 40.0);
                 }
@@ -1287,7 +1350,7 @@ impl Rustym {
                     ui.horizontal_top(|ui| {
                         ui.allocate_ui_with_layout(Vec2::new(art_side, art_side), Layout::top_down(Align::Center), |ui| {
                             let (art, _) = ui.allocate_exact_size(Vec2::splat(art_side), Sense::hover());
-                            thumb(ui, &t.id, art, 18.0);
+                            glow_art(ui, th, &t.id, art);
                         });
                         ui.add_space(18.0);
                         ui.allocate_ui_with_layout(Vec2::new(info_width, column_height), Layout::top_down(Align::Min), |ui| {
@@ -1295,29 +1358,33 @@ impl Rustym {
                             ui.add_space(8.0);
                             ui.label(RichText::new("NOW PLAYING").size(10.0).strong().color(th.accent));
                             ui.add_space(10.0);
-                            ui.label(RichText::new(&t.title).size(25.0).strong().color(th.text));
+                            ui.label(RichText::new(&t.title).size(26.0).strong().color(th.text));
                             ui.add_space(8.0);
                             ui.label(RichText::new(&t.artist).size(15.0).color(th.dim2));
                             if !t.album.is_empty() {
-                                ui.add_space(5.0);
-                                ui.label(RichText::new(&t.album).size(12.5).color(th.dim));
+                                ui.add_space(8.0);
+                                album_chip(ui, th, &t.album);
                             }
-                            ui.add_space(20.0);
+                            ui.add_space(18.0);
                             ui.horizontal_wrapped(|ui| {
                                 let liked = self.liked_ids.contains(&t.id);
                                 if ui.add(accent_button(th, if liked { "♥  Liked" } else { "♡  Like" })).clicked() && t.local.is_empty() {
                                     self.toggle_like(&t);
                                 }
-                                if ui.add(egui::Button::new(RichText::new("Hide lyrics").color(th.text)).rounding(10.0)).clicked() {
-                                    self.lyrics_enabled = false;
-                                    self.cfg.auto_show_lyrics = false;
+                                if ui.add(egui::Button::new(RichText::new(if lyrics_shown { "Hide lyrics" } else { "♫  Show lyrics" }).color(th.text)).rounding(10.0)).clicked() {
+                                    self.lyrics_enabled = !lyrics_shown;
+                                    self.cfg.auto_show_lyrics = self.lyrics_enabled;
                                     self.cfg.save();
                                 }
                             });
                             ui.add_space(14.0);
-                            if self.snap.loading { spin(ui, th); }
-                            else if self.snap.paused { ui.label(RichText::new("Paused").size(12.0).color(th.dim)); }
-                            else { ui.label(RichText::new("Enjoying your music").size(12.0).color(th.dim)); }
+                            if self.snap.loading {
+                                ui.horizontal(|ui| { spin(ui, th); ui.label(RichText::new("Preparing your track…").size(12.0).color(th.dim)); });
+                            } else if self.snap.paused {
+                                ui.label(RichText::new("⏸  Paused").size(12.0).color(th.dim));
+                            } else {
+                                ui.label(RichText::new("Enjoying your music").size(12.0).color(th.dim));
+                            }
                         });
                         ui.add_space(18.0);
                         ui.allocate_ui_with_layout(Vec2::new(lyrics_width, column_height), Layout::top_down(Align::Min), |ui| {
@@ -1325,20 +1392,10 @@ impl Rustym {
                                 .inner_margin(Margin::same(14.0)).show(ui, |ui| {
                                     ui.set_width(lyrics_width - 28.0);
                                     if expanded_height { ui.set_min_height(column_height - 28.0); }
-                                    ui.horizontal(|ui| {
-                                        ui.label(RichText::new("LYRICS").size(11.0).strong().color(th.accent));
-                                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                            if ui.small_button("×").clicked() {
-                                                self.lyrics_enabled = false;
-                                                self.cfg.auto_show_lyrics = false;
-                                                self.cfg.save();
-                                            }
-                                        });
-                                    });
-                                    ui.add_space(8.0);
+                                    ui.add_space(2.0);
                                     egui::ScrollArea::vertical()
                                         .id_salt("now-playing-lyrics-panel")
-                                        .max_height(column_height - 54.0)
+                                        .max_height(column_height - 34.0)
                                         .max_width(lyrics_width - 28.0)
                                         .auto_shrink([false, false])
                                         .show(ui, |ui| {
@@ -1354,21 +1411,21 @@ impl Rustym {
                     ui.horizontal_top(|ui| {
                         ui.allocate_ui_with_layout(Vec2::new(art_side, art_side), Layout::top_down(Align::Center), |ui| {
                             let (art, _) = ui.allocate_exact_size(Vec2::splat(art_side), Sense::hover());
-                            thumb(ui, &t.id, art, 18.0);
+                            glow_art(ui, th, &t.id, art);
                         });
                         ui.add_space(18.0);
                         ui.allocate_ui_with_layout(Vec2::new(info_width, art_side), Layout::top_down(Align::Min), |ui| {
                             ui.add_space(8.0);
                             ui.label(RichText::new("NOW PLAYING").size(10.0).strong().color(th.accent));
                             ui.add_space(10.0);
-                            ui.label(RichText::new(&t.title).size(25.0).strong().color(th.text));
+                            ui.label(RichText::new(&t.title).size(26.0).strong().color(th.text));
                             ui.add_space(8.0);
                             ui.label(RichText::new(&t.artist).size(15.0).color(th.dim2));
                             if !t.album.is_empty() {
-                                ui.add_space(5.0);
-                                ui.label(RichText::new(&t.album).size(12.5).color(th.dim));
+                                ui.add_space(8.0);
+                                album_chip(ui, th, &t.album);
                             }
-                            ui.add_space(20.0);
+                            ui.add_space(18.0);
                             ui.horizontal_wrapped(|ui| {
                                 let liked = self.liked_ids.contains(&t.id);
                                 if ui.add(accent_button(th, if liked { "♥  Liked" } else { "♡  Like" })).clicked() && t.local.is_empty() {
@@ -1381,9 +1438,13 @@ impl Rustym {
                                 }
                             });
                             ui.add_space(14.0);
-                            if self.snap.loading { spin(ui, th); }
-                            else if self.snap.paused { ui.label(RichText::new("Paused").size(12.0).color(th.dim)); }
-                            else { ui.label(RichText::new("Enjoying your music").size(12.0).color(th.dim)); }
+                            if self.snap.loading {
+                                ui.horizontal(|ui| { spin(ui, th); ui.label(RichText::new("Preparing your track…").size(12.0).color(th.dim)); });
+                            } else if self.snap.paused {
+                                ui.label(RichText::new("⏸  Paused").size(12.0).color(th.dim));
+                            } else {
+                                ui.label(RichText::new("Enjoying your music").size(12.0).color(th.dim));
+                            }
                         });
                     });
                     if lyrics_shown {
@@ -1399,8 +1460,7 @@ impl Rustym {
                                 if expanded_height {
                                     ui.set_min_height(compact_lyrics_height - 28.0);
                                 }
-                                ui.label(RichText::new("LYRICS").size(11.0).strong().color(th.accent));
-                                ui.add_space(8.0);
+                                ui.add_space(2.0);
                                 egui::ScrollArea::vertical()
                                     .id_salt("now-playing-lyrics-compact")
                                     .max_height(compact_lyrics_height - 48.0)
@@ -1432,7 +1492,13 @@ impl Rustym {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("AUDIO VISUALISER").size(10.0).strong().color(th.dim));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            ui.label(RichText::new("Click to change style").size(10.0).color(th.dim));
+                            for (i, name) in ["Radial", "Mirror", "Bars"].iter().enumerate() {
+                                let active = self.cfg.viz == 2 - i;
+                                if ui.add(egui::Button::new(RichText::new(*name).size(10.5).color(if active { th.text } else { th.dim })).fill(if active { th.card2 } else { th.card }).rounding(8.0)).clicked() {
+                                    self.cfg.viz = 2 - i;
+                                    self.cfg.save();
+                                }
+                            }
                         });
                     });
                     ui.add_space(8.0);
@@ -1448,23 +1514,25 @@ impl Rustym {
     fn draw_lyrics(&mut self, ui: &mut egui::Ui) {
         let th = self.theme;
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Lyrics").size(20.0).strong().color(th.text));
+            ui.label(RichText::new("Lyrics").size(19.0).strong().color(th.text));
             if let Some(l) = &self.lyrics {
-                ui.label(RichText::new(format!("via {}", l.source)).size(11.5).color(th.dim));
+                ui.label(RichText::new(format!("via {}", l.source)).size(11.0).color(th.dim));
             }
-            if self.lyrics.as_ref().map_or(false, |l| !l.synced.is_empty()) {
-                if ui.small_button("−0.5 s").clicked() {
-                    self.cfg.lyrics_offset -= 500;
-                    self.cfg.save();
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if self.lyrics.as_ref().map_or(false, |l| !l.synced.is_empty()) {
+                    if self.cfg.lyrics_offset != 0 {
+                        ui.label(RichText::new(format!("{:+} ms", self.cfg.lyrics_offset)).size(11.0).color(th.accent));
+                    }
+                    if ui.add(egui::Button::new(RichText::new("+0.5 s").size(10.5).color(th.dim2)).fill(th.card).rounding(8.0)).clicked() {
+                        self.cfg.lyrics_offset += 500;
+                        self.cfg.save();
+                    }
+                    if ui.add(egui::Button::new(RichText::new("−0.5 s").size(10.5).color(th.dim2)).fill(th.card).rounding(8.0)).clicked() {
+                        self.cfg.lyrics_offset -= 500;
+                        self.cfg.save();
+                    }
                 }
-                if ui.small_button("+0.5 s").clicked() {
-                    self.cfg.lyrics_offset += 500;
-                    self.cfg.save();
-                }
-                if self.cfg.lyrics_offset != 0 {
-                    ui.label(RichText::new(format!("{:+} ms", self.cfg.lyrics_offset)).size(11.5).color(th.dim));
-                }
-            }
+            });
         });
         ui.add_space(6.0);
         if self.lyrics_loading {

@@ -2046,8 +2046,12 @@ pub fn spawn_viz() -> Arc<Mutex<VizData>> {
         PAREC_PID.store(child.id(), SeqCst);
         let Some(mut out) = child.stdout.take() else { return };
         const N: usize = 1024;
-        let fs = 22050.0f32;
+        const FS: f32 = 22050.0;
         let mut buf = [0u8; N * 2];
+        // Reused every chunk - the visualiser runs ~60 times per second, so
+        // allocating fresh Vecs for each frame would churn the allocator.
+        let mut samples = [0f32; N];
+        let mut raw = [0f32; BANDS];
         let win: Vec<f32> = (0..N)
             .map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / (N as f32 - 1.0)).cos())
             .collect();
@@ -2059,13 +2063,12 @@ pub fn spawn_viz() -> Arc<Mutex<VizData>> {
             if out.read_exact(&mut buf).is_err() {
                 break;
             }
-            let samples: Vec<f32> = (0..N)
-                .map(|i| i16::from_le_bytes([buf[2 * i], buf[2 * i + 1]]) as f32 / 32768.0 * win[i])
-                .collect();
-            let mut raw = vec![0.0f32; BANDS];
+            for (i, s) in samples.iter_mut().enumerate() {
+                *s = i16::from_le_bytes([buf[2 * i], buf[2 * i + 1]]) as f32 / 32768.0 * win[i];
+            }
             let mut mx = 0.0f32;
             for (i, &f) in freqs.iter().enumerate() {
-                let a = goertzel(&samples, f, fs);
+                let a = goertzel(&samples, f, FS);
                 let db = 20.0 * (a + 1e-7).log10();
                 let v = ((db + 72.0) / 52.0).clamp(0.0, 1.0) * (0.85 + 0.3 * i as f32 / BANDS as f32);
                 raw[i] = v;
@@ -2076,7 +2079,7 @@ pub fn spawn_viz() -> Arc<Mutex<VizData>> {
                 *v = (*v / peak).clamp(0.0, 1.0);
             }
             let mut g = d.lock().unwrap();
-            g.levels = raw;
+            g.levels = raw.to_vec();
             g.updated = Instant::now();
             g.live = true;
         }
