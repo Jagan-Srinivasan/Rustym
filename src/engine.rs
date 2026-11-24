@@ -145,7 +145,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            theme: 6, // Midnight
+            theme: 2, // Emerald (green)
             browser: String::new(),
             account_name: String::new(),
             account_photo: String::new(),
@@ -2360,6 +2360,29 @@ struct RustymTray {
     win: Arc<WinCtl>,
 }
 
+/// The tray icon as an in-binary ARGB32 pixmap. Some StatusNotifier hosts (certain panels,
+/// appindicator setups and some Wayland bars) never resolve the theme `IconName`, or cannot load
+/// the installed SVG, and would show an empty slot. Shipping the pixels alongside the name makes
+/// the icon show up everywhere, installed or not.
+static TRAY_PIXMAP: std::sync::LazyLock<ksni::Icon> = std::sync::LazyLock::new(|| {
+    let img = image::load_from_memory_with_format(
+        include_bytes!("../packaging/icons/rustym.png"),
+        image::ImageFormat::Png,
+    )
+    .expect("valid tray icon PNG");
+    use image::GenericImageView;
+    let (width, height) = img.dimensions();
+    let mut data = img.into_rgba8().into_vec();
+    for pixel in data.chunks_exact_mut(4) {
+        pixel.rotate_right(1); // RGBA -> ARGB
+    }
+    ksni::Icon {
+        width: width as i32,
+        height: height as i32,
+        data,
+    }
+});
+
 impl ksni::Tray for RustymTray {
     fn id(&self) -> String {
         "rustym".into()
@@ -2369,6 +2392,9 @@ impl ksni::Tray for RustymTray {
     }
     fn icon_name(&self) -> String {
         "rustym".into()
+    }
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+        vec![TRAY_PIXMAP.clone()]
     }
     fn activate(&mut self, _x: i32, _y: i32) {
         toggle_window(&self.win);

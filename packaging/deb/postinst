@@ -1,0 +1,12 @@
+#!/bin/sh
+# Refresh the icon-theme cache so the freshly installed Rustym icons are found
+# immediately (the tray icon is looked up by name through the icon theme).
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+    gtk-update-icon-cache -f -t /usr/share/icons/hicolor >/dev/null 2>&1 || true
+fi
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database -q >/dev/null 2>&1 || true
+fi
+# debhelper's generated postinst (if any) would run here; cargo-deb does not
+# generate one, so nothing else is needed.
+exit 0
