@@ -136,6 +136,8 @@ enum Msg {
     LikedIds(Vec<String>),
     /// Google account name + avatar URL.
     Account(String, String),
+    /// Spotify import finished: (playlist name, matched tracks).
+    SpotifyImported(String, Vec<Track>),
     /// User-facing notice shown as a toast.
     Toast(String),
     PlayNow(Vec<Track>),
@@ -1073,6 +1075,10 @@ struct Rustym {
     open_detail_later: Option<(ytm::Kind, String)>,
     /// Whether lyrics are enabled in Now Playing; remains on as the queue advances.
     lyrics_enabled: bool,
+    /// Whether the Now Playing right pane shows the vinyl player (a ring button toggles it).
+    vinyl_open: bool,
+    /// Spotify playlist link typed into the import box.
+    spotify_url: String,
     /// Last time listening stats were re-read from disk (the background process writes them).
     store_t: Instant,
     tray_ok: bool,
@@ -1180,6 +1186,8 @@ impl Rustym {
             open_detail_later: None,
             lyrics_enabled: auto_show_lyrics,
             store_t: Instant::now().checked_sub(Duration::from_secs(10)).unwrap_or_else(Instant::now),
+            vinyl_open: false,
+            spotify_url: String::new(),
             tray_ok: true,
             tray_checked: Instant::now(),
             last_current_id: String::new(),
@@ -1659,6 +1667,16 @@ impl Rustym {
                     self.cfg.save();
                 }
                 Msg::Toast(t) => self.toast = Some((t, Instant::now())),
+                Msg::SpotifyImported(name, tracks) => {
+                    if tracks.is_empty() {
+                        self.toast = Some(("No Spotify tracks could be matched".into(), Instant::now()));
+                    } else {
+                        let n = tracks.len();
+                        self.cfg.playlists.push(Playlist { name: name.clone(), tracks });
+                        self.cfg.save();
+                        self.toast = Some((format!("Imported “{name}” with {n} tracks"), Instant::now()));
+                    }
+                }
                 Msg::PlayNow(v) => {
                     if let Some(t) = v.first().cloned() {
                         self.record_recent(t);
@@ -1921,18 +1939,20 @@ impl Rustym {
 
                 ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
                     if self.cfg.signed_in {
-                        if ui.add(egui::Button::new(RichText::new("Sign out").size(12.0).color(th.dim)).frame(false)).clicked() {
-                            self.sign_out();
-                        }
-                        ui.add_space(8.0);
+                        // One aligned row: avatar | name | sign out (right).
                         let w = ui.available_width();
                         ui.allocate_ui_with_layout(Vec2::new(w, 40.0), Layout::left_to_right(Align::Center), |ui| {
                             account_avatar(ui, th, &self.cfg.account_photo, &self.cfg.account_name, 34.0);
-                            let nm = if self.cfg.account_name.is_empty() { "Signed in".to_string() } else { short_name(&self.cfg.account_name, 16) };
                             ui.vertical(|ui| {
                                 ui.spacing_mut().item_spacing.y = 1.0;
-                                ui.label(RichText::new(nm).size(13.5).strong().color(th.text));
-                                ui.label(RichText::new("● Google account").size(11.0).color(th.accent));
+                                let nm = if self.cfg.account_name.is_empty() { "Signed in".to_string() } else { short_name(&self.cfg.account_name, 16) };
+                                ui.label(RichText::new(nm).size(13.0).strong().color(th.text));
+                                ui.label(RichText::new("● Google account").size(10.5).color(th.accent));
+                            });
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.add(egui::Button::new(RichText::new("Sign out").size(11.0).color(th.dim)).frame(false)).clicked() {
+                                    self.sign_out();
+                                }
                             });
                         });
                     } else if self.login_waiting {
@@ -2541,6 +2561,34 @@ impl Rustym {
         if enter && !self.new_pl.trim().is_empty() {
             create = true;
         }
+        ui.add_space(8.0);
+        // Spotify playlist import (public playlists, matched to YouTube Music).
+        ui.horizontal(|ui| {
+            ui.allocate_ui_with_layout(Vec2::new(460.0, 44.0), Layout::left_to_right(Align::Center), |ui| {
+                egui::Frame::none().fill(th.card).rounding(22.0).inner_margin(Margin::symmetric(16.0, 8.0)).show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.spotify_url)
+                            .hint_text("Paste a Spotify playlist link (open.spotify.com/playlist/…)")
+                            .frame(false)
+                            .font(FontId::proportional(13.5))
+                            .desired_width(400.0),
+                    );
+                });
+            });
+            if ui.add_sized([120.0, 44.0], accent_button(th, "Import")).clicked() {
+                if self.spotify_url.trim().is_empty() {
+                    self.toast = Some(("Paste a Spotify playlist link first".into(), Instant::now()));
+                } else {
+                    let url = self.spotify_url.trim().to_string();
+                    self.toast = Some(("Importing Spotify playlist (matching each track on YouTube Music)…".into(), Instant::now()));
+                    self.bg(ctx, move || match engine::spotify_import(&url) {
+                        Ok((name, tracks)) => Msg::SpotifyImported(name, tracks),
+                        Err(e) => Msg::Toast(format!("Spotify import failed: {e}")),
+                    });
+                }
+            }
+        });
+        ui.label(RichText::new("Works with public playlists. Each Spotify track is searched on YouTube Music and added to a new local playlist.").size(11.5).color(th.dim));
         if create && !self.new_pl.trim().is_empty() {
             self.cfg.playlists.push(Playlist { name: self.new_pl.trim().to_string(), tracks: vec![] });
             self.new_pl.clear();
@@ -3182,7 +3230,9 @@ impl Rustym {
                 let w = (ui.available_width() * 0.42).clamp(240.0, 420.0);
                 let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 34.0), Sense::click());
                 let p = ui.painter();
-                p.rect_filled(rect, 17.0, th.card);
+                // Lighter fill + a visible stroke so the pill stands out on any theme.
+                p.rect_filled(rect, 17.0, th.card2);
+                p.rect_stroke(rect, 17.0, Stroke::new(1.0_f32, lerp_col(th.card2, th.text, 0.25)));
                 p.text(
                     Pos2::new(rect.left() + 16.0, rect.center().y),
                     Align2::LEFT_CENTER,

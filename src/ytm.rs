@@ -338,6 +338,15 @@ fn sapisid_header(vals: &HashMap<String, String>, ts: u64) -> String {
 
 // ---------------- transport ----------------
 
+/// Plain HTTPS GET for non-YouTube pages (used by the Spotify playlist import).
+pub fn fetch_text(url: &str) -> Result<String, String> {
+    match agent().get(url).set("Accept", "text/html,application/json").call() {
+        Ok(resp) => resp.into_string().map_err(|e| format!("unreadable reply: {e}")),
+        Err(ureq::Error::Status(code, _)) => Err(format!("HTTP {code}")),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 fn agent() -> &'static ureq::Agent {
     static A: OnceLock<ureq::Agent> = OnceLock::new();
     A.get_or_init(|| ureq::AgentBuilder::new().timeout(Duration::from_secs(25)).user_agent(UA).build())

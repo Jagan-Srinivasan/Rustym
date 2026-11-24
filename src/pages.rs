@@ -1352,34 +1352,46 @@ impl Rustym {
             return;
         };
 
-        ui.add_space(10.0);
+        ui.add_space(8.0);
 
         let available = ui.available_width().max(320.0);
         let available_height = ui.available_height();
         let lyrics_shown = self.lyrics_enabled;
         let wide = available >= 980.0;
-        let wide_lyrics = lyrics_shown && wide;
-        let show_vinyl = wide && !lyrics_shown;
+        // What goes into the right pane on wide windows:
+        //  * the vinyl player by default (also when no lyrics were found),
+        //  * the lyrics panel when lyrics are enabled and found (or being found),
+        //  * the vinyl again whenever the user presses the vinyl ring button.
+        let lyrics_ready = self.lyrics.as_ref().map_or(false, |l| !l.synced.is_empty() || !l.plain.trim().is_empty());
+        let show_lyrics_pane = wide && lyrics_shown && (lyrics_ready || self.lyrics_loading);
+        let show_vinyl_pane = wide && (!show_lyrics_pane || self.vinyl_open);
         let inner_width = (available - 40.0).max(240.0);
 
         // When the visualiser is hidden, use the full vertical space left by the
-        // header and bottom player; grow all columns together.
+        // top bar and bottom player (small breathing margin only).
         let expanded_height = !self.cfg.show_visualiser;
-        let card_content_height = if expanded_height { (available_height - 62.0).max(300.0) } else { 0.0 };
-        let art_side = if expanded_height && (wide_lyrics || show_vinyl) {
+        let card_content_height = if expanded_height { (available_height - 26.0).max(300.0) } else { 0.0 };
+        let wide_pane = show_lyrics_pane || show_vinyl_pane;
+        let art_side = if expanded_height && wide_pane {
             ((card_content_height - 40.0).min(inner_width * 0.36)).clamp(280.0, 420.0)
         } else if available >= 900.0 {
             280.0
         } else {
             (available * 0.38).clamp(150.0, 230.0)
         };
-        let right_width = (inner_width - art_side - 48.0).clamp(240.0, 430.0);
-        let info_width = if wide_lyrics || show_vinyl {
-            350.0_f32.min((inner_width - art_side - 300.0).max(250.0))
+        let info_width = if wide_pane {
+            340.0_f32.min((inner_width - art_side - 320.0).max(250.0))
         } else {
             (inner_width - art_side - 28.0).max(190.0)
         };
-        let lyrics_width = if wide_lyrics { right_width } else { 0.0 };
+        // The hero row is: art | info | pane, joined by item spacing + our own
+        // add_space calls (~70 px total). Size the pane to what really remains
+        // so it can never push past the card edge.
+        let pane_width = if wide_pane {
+            (inner_width - art_side - info_width - 70.0).max(200.0)
+        } else {
+            0.0
+        };
         let card_min_height = if expanded_height { card_content_height } else { 0.0 };
         let column_height = if expanded_height { card_content_height - 40.0 } else { art_side }.max(art_side);
         let playing = self.snap.playing && !self.snap.paused;
@@ -1409,9 +1421,9 @@ impl Rustym {
                     ui.label(RichText::new("N O W   P L A Y I N G").size(10.0).strong().color(th.accent));
                     ui.add_space(8.0);
                     // Title and artist wrap so long names are never cut off.
-                    ui.add(egui::Label::new(RichText::new(&t.title).font(serif_id(36.0)).color(th.text)));
+                    ui.add(egui::Label::new(RichText::new(&t.title).font(serif_id(34.0)).color(th.text)));
                     ui.add_space(6.0);
-                    ui.add(egui::Label::new(RichText::new(&t.artist).font(serif_italic_id(20.0)).color(th.dim2)));
+                    ui.add(egui::Label::new(RichText::new(&t.artist).font(serif_italic_id(19.0)).color(th.dim2)));
                     ui.add_space(12.0);
                     // Meta row: like state · album
                     let mut meta = if liked { "♥  Liked".to_string() } else { String::new() };
@@ -1439,9 +1451,15 @@ impl Rustym {
                             s.cfg.auto_show_lyrics = s.lyrics_enabled;
                             s.cfg.save();
                         }
+                        if ring_btn(ui, th, "◉", s.vinyl_open).clicked() {
+                            s.vinyl_open = !s.vinyl_open;
+                        }
                         if ring_btn(ui, th, "◔", s.cfg.show_visualiser).clicked() {
                             s.cfg.show_visualiser = !s.cfg.show_visualiser;
                             s.cfg.save();
+                        }
+                        if ring_btn(ui, th, "＋", false).clicked() {
+                            s.adding = Some(t.clone());
                         }
                         if ring_btn(ui, th, "≡", s.show_queue).clicked() {
                             s.show_queue = !s.show_queue;
@@ -1475,8 +1493,8 @@ impl Rustym {
                     }
                 };
 
-                if show_vinyl {
-                    // Hero: artwork | info | spinning vinyl with mini equaliser.
+                if wide_pane {
+                    // Hero: artwork | info | lyrics panel or vinyl player.
                     ui.horizontal_top(|ui| {
                         ui.allocate_ui_with_layout(Vec2::new(art_side, art_side), Layout::top_down(Align::Center), |ui| {
                             let (art, _) = ui.allocate_exact_size(Vec2::splat(art_side), Sense::hover());
@@ -1487,40 +1505,28 @@ impl Rustym {
                             info_column(ui, self, column_height);
                         });
                         ui.add_space(12.0);
-                        ui.allocate_ui_with_layout(Vec2::new(right_width, column_height), Layout::top_down(Align::Center), |ui| {
-                            let vsize = right_width.min(column_height - 90.0).max(150.0);
-                            let disp = self.disp.clone();
-                            vinyl(ui, th, vsize, playing, &disp);
-                        });
-                    });
-                } else if wide_lyrics && lyrics_width >= 260.0 {
-                    // Hero with lyrics panel on the right.
-                    ui.horizontal_top(|ui| {
-                        ui.allocate_ui_with_layout(Vec2::new(art_side, art_side), Layout::top_down(Align::Center), |ui| {
-                            let (art, _) = ui.allocate_exact_size(Vec2::splat(art_side), Sense::hover());
-                            glow_art(ui, th, &t.id, art);
-                        });
-                        ui.add_space(18.0);
-                        ui.allocate_ui_with_layout(Vec2::new(info_width, column_height), Layout::top_down(Align::Min), |ui| {
-                            info_column(ui, self, column_height);
-                        });
-                        ui.add_space(18.0);
-                        ui.allocate_ui_with_layout(Vec2::new(lyrics_width, column_height), Layout::top_down(Align::Min), |ui| {
-                            egui::Frame::none().fill(th.panel).rounding(16.0)
-                                .inner_margin(Margin::same(14.0)).show(ui, |ui| {
-                                    ui.set_width(lyrics_width - 28.0);
-                                    if expanded_height { ui.set_min_height(column_height - 28.0); }
-                                    ui.add_space(2.0);
-                                    egui::ScrollArea::vertical()
-                                        .id_salt("now-playing-lyrics-panel")
-                                        .max_height(column_height - 34.0)
-                                        .max_width(lyrics_width - 28.0)
-                                        .auto_shrink([false, false])
-                                        .show(ui, |ui| {
-                                            ui.set_width(lyrics_width - 32.0);
-                                            self.draw_lyrics(ui);
-                                        });
-                                });
+                        ui.allocate_ui_with_layout(Vec2::new(pane_width, column_height), Layout::top_down(Align::Center), |ui| {
+                            if show_vinyl_pane {
+                                let vsize = pane_width.min(column_height - 90.0).max(150.0);
+                                let disp = self.disp.clone();
+                                vinyl(ui, th, vsize, playing, &disp);
+                            } else {
+                                egui::Frame::none().fill(th.panel).rounding(16.0)
+                                    .inner_margin(Margin::same(14.0)).show(ui, |ui| {
+                                        ui.set_width(pane_width - 28.0);
+                                        if expanded_height { ui.set_min_height(column_height - 28.0); }
+                                        ui.add_space(2.0);
+                                        egui::ScrollArea::vertical()
+                                            .id_salt("now-playing-lyrics-panel")
+                                            .max_height(column_height - 34.0)
+                                            .max_width(pane_width - 28.0)
+                                            .auto_shrink([false, false])
+                                            .show(ui, |ui| {
+                                                ui.set_width(pane_width - 32.0);
+                                                self.draw_lyrics(ui);
+                                            });
+                                    });
+                            }
                         });
                     });
                 } else {

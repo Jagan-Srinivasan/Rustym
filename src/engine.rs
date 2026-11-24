@@ -540,6 +540,123 @@ pub fn run_health_checks(play: bool) {
 
 const YTDL_FORMAT: &str = "140/251/bestaudio[protocol^=http][protocol!*=m3u8]/bestaudio/best";
 
+// ---------------- Spotify playlist import ----------------
+
+/// Unescapes the JSON string escapes we can meet in Spotify's embed data.
+fn json_unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => {},
+                Some('u') => {
+                    let hex: String = chars.by_ref().take(4).collect();
+                    if let Ok(cp) = u32::from_str_radix(&hex, 16) {
+                        if let Some(ch) = char::from_u32(cp) {
+                            out.push(ch);
+                        }
+                    }
+                }
+                Some(e) => out.push(e),
+                None => {},
+            },
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Reads one JSON-escaped string starting at the opening `"` at `at`.
+/// Returns the string and the index just after its closing quote.
+fn json_str_from(s: &str, at: usize) -> Option<(String, usize)> {
+    let b = s.as_bytes();
+    if at >= b.len() || b[at] != b'"' {
+        return None;
+    }
+    let mut i = at + 1;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 2,
+            b'"' => {
+                let raw = &s[at + 1..i];
+                return Some((json_unescape(raw), i + 1));
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Imports a public Spotify playlist through its embed page (no Spotify login
+/// needed): the embed HTML contains the track list, which is matched to
+/// YouTube Music songs one by one. Returns (playlist name, matched tracks).
+pub fn spotify_import(url: &str) -> Result<(String, Vec<Track>), String> {
+    let url = url.trim();
+    let id = if let Some(p) = url.find("playlist/") {
+        let rest = &url[p + 9..];
+        rest.split(['?', '&', '"']).next().unwrap_or("").to_string()
+    } else if let Some(p) = url.find("spotify:playlist:") {
+        url[p + 17..].split([' ', '\"']).next().unwrap_or("").to_string()
+    } else {
+        String::new()
+    };
+    if id.len() < 16 {
+        return Err("Paste a Spotify playlist link (open.spotify.com/playlist/… or spotify:playlist:…)".into());
+    }
+    let html = crate::ytm::fetch_text(&format!("https://open.spotify.com/embed/playlist/{id}"))?;
+
+    // Playlist name: the first "name":" before the track list.
+    let tracklist_at = html.find("\"trackList\"").ok_or("That Spotify playlist looks empty or private")?;
+    let name = html[..tracklist_at]
+        .rfind("\"name\":\"")
+        .and_then(|p| json_str_from(&html, p + 7))
+        .map(|(s, _)| s)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "Spotify import".to_string());
+
+    // Tracks: "title":"…" followed by "subtitle":"…" (artists).
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut i = tracklist_at;
+    while let Some(rel) = html[i..].find("\"title\":\"") {
+        let at = i + rel + 8;
+        let Some((title, after)) = json_str_from(&html, at) else { break };
+        let window = &html[after..(after + 400).min(html.len())];
+        let artist = window
+            .find("\"subtitle\":\"")
+            .and_then(|p| json_str_from(window, p + 12))
+            .map(|(s, _)| s)
+            .unwrap_or_default();
+        if !title.trim().is_empty() {
+            pairs.push((title, artist));
+        }
+        i = after;
+        if pairs.len() >= 50 {
+            break;
+        }
+    }
+    if pairs.is_empty() {
+        return Err("No tracks found in that Spotify playlist".into());
+    }
+
+    let mut tracks = Vec::new();
+    let mut missed = 0usize;
+    for (title, artist) in pairs.iter() {
+        let q = if artist.is_empty() { title.clone() } else { format!("{title} {artist}") };
+        match crate::ytm::search(&q, 1) {
+            Ok(o) if !o.songs.is_empty() => tracks.push(o.songs[0].clone()),
+            _ => missed += 1,
+        }
+    }
+    if tracks.is_empty() {
+        return Err("None of the Spotify tracks could be matched on YouTube Music".into());
+    }
+    let _ = missed;
+    Ok((name, tracks))
+}
+
 // ---------------- yt-dlp / login ----------------
 
 pub fn run_ytdlp(args: Vec<String>) -> Result<Vec<Track>, String> {
