@@ -1,0 +1,39 @@
+# Maintainer: Jagan Srinivasan <jaganrmkcet@gmail.com>
+# Build with: makepkg -f   (then: pacman -U rustym-*.pkg.tar.zst)
+pkgname=rustym
+pkgver=0.4.0
+pkgrel=1
+pkgdesc="Ad-free, feature-rich YouTube Music player for Linux (pure Rust + egui)"
+arch=('x86_64')
+url="https://github.com/Jagan-Srinivasan/Rustym"
+license=('GPL-3.0-only')
+depends=('mpv' 'yt-dlp' 'ffmpeg' 'gtk3' 'webkit2gtk-4.1' 'libxkbcommon' 'libx11' 'libxcursor'
+         'libxrandr' 'libxi' 'wayland' 'fontconfig' 'noto-fonts' 'xdg-utils')
+optdepends=('deno: JavaScript runtime used by yt-dlp to solve YouTube stream challenges')
+makedepends=('cargo' 'pkgconf')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/Jagan-Srinivasan/Rustym/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+# The source tarball extracts as Rustym-<ver> (repo name); CI checkouts use rustym-<ver>.
+_srcdir() {
+    if [ -d "$pkgname-$pkgver" ]; then echo "$pkgname-$pkgver"; else echo "Rustym-$pkgver"; fi
+}
+
+prepare() {
+    cd "$(_srcdir)"
+}
+
+build() {
+    cd "$(_srcdir)"
+    export CARGO_HOME="$srcdir/.cargo-home"
+    cargo build --release --frozen
+}
+
+package() {
+    cd "$(_srcdir)"
+    install -Dm755 target/release/rustym -t "$pkgdir/usr/bin/"
+    install -Dm755 target/release/rustym-login -t "$pkgdir/usr/bin/"
+    install -Dm644 packaging/rustym.svg "$pkgdir/usr/share/icons/hicolor/scalable/apps/rustym.svg"
+    sed 's|@BIN@|/usr/bin|g' packaging/rustym.desktop.in > "$pkgdir/usr/share/applications/rustym.desktop"
+    chmod 644 "$pkgdir/usr/share/applications/rustym.desktop"
+}

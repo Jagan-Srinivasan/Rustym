@@ -1,0 +1,114 @@
+name: Build & package
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------- .deb (Debian/Ubuntu) and .rpm (Fedora) ----------
+  deb-rpm:
+    name: Build .deb + .rpm
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      - name: Prepare desktop file (@BIN@ -> /usr/bin)
+        run: |
+          mkdir -p target
+          sed 's|@BIN@|/usr/bin|g' packaging/rustym.desktop.in > target/rustym.desktop
+
+      - name: Build .deb (cargo-deb)
+        run: |
+          cargo install --locked cargo-deb
+          cargo deb --no-build
+
+      - name: Build .rpm (cargo-generate-rpm)
+        run: |
+          cargo install --locked cargo-generate-rpm
+          cargo generate-rpm
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p dist
+          cp target/debian/*.deb dist/
+          cp target/generate-rpm/*.rpm dist/
+          ls -l dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-deb-rpm
+          path: dist/*
+
+  # ---------- Arch Linux .pkg.tar.zst ----------
+  arch:
+    name: Build Arch package
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install build dependencies
+        run: |
+          pacman -Syu --noconfirm --needed git rust webkit2gtk-4.1 gtk3 pkgconf
+
+      - uses: actions/checkout@v4
+
+      - name: Package with makepkg
+        run: |
+          VER=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+          cp packaging/PKGBUILD .
+
+          if [ "$GITHUB_REF_TYPE" != tag ]; then
+            # Not a tag: build from this checkout instead of the tag tarball
+            sed -i 's|^source=.*|source=()|; s|^sha256sums=.*|sha256sums=()|' PKGBUILD
+            mkdir -p src/rustym-$VER
+            tar --exclude=./src --exclude=./target --exclude=./dist -cf - . | tar -xf - -C src/rustym-$VER
+          fi
+
+          useradd -m builder
+          chown -R builder:builder .
+          su builder -c "makepkg -f --noconfirm"
+          mkdir -p dist
+          cp rustym-*.pkg.tar.zst dist/
+          ls -l dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages-arch
+          path: dist/*
+
+  # ---------- Attach packages to a GitHub release on tag push ----------
+  release:
+    name: Attach to GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [deb-rpm, arch]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: packages-*
+          merge-multiple: true
+          path: dist
+
+      - name: Create release
+        run: |
+          ls -l dist/
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "Rustym $GITHUB_REF_NAME" \
+            --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

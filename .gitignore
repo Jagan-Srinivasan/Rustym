@@ -1,8 +1,0 @@
-/target/
-dist/
-*.tar.gz
-*.deb
-*.pkg.tar.zst
-*.rpm
-*.AppImage
-__pycache__/
