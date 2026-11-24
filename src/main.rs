@@ -15,7 +15,7 @@ use eframe::egui::{
     Pos2, Rect, RichText, Sense, Shape, Stroke, Vec2,
 };
 use engine::*;
-use eframe::egui::load::BytesLoader;
+use eframe::egui::load::{BytesLoader, ImageLoader};
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -136,6 +136,7 @@ enum Msg {
     LikedIds(Vec<String>),
     /// Google account name + avatar URL.
     Account(String, String),
+    /// User-facing notice shown as a toast.
     Toast(String),
     PlayNow(Vec<Track>),
     Local(Vec<Track>),
@@ -429,7 +430,7 @@ fn mix_card(ui: &mut egui::Ui, th: Theme, title: &str, sub: &str, c1: Color32, c
     p.circle_filled(Pos2::new(r.right() - w * 0.2, r.top() + h * 0.36), h * 0.26, dec);
     p.circle_stroke(Pos2::new(r.right() - w * 0.2, r.top() + h * 0.36), h * 0.34, Stroke::new(1.5_f32, Color32::from_white_alpha(30)));
     p.circle_filled(Pos2::new(r.left() + w * 0.12, r.bottom() - h * 0.1), h * 0.12, dec);
-    let clip = p.with_clip_rect(r.shrink(2.0));
+    let clip = p.with_clip_rect(Rect::from_min_max(r.left_top(), Pos2::new(r.right() - 58.0, r.bottom())).shrink(2.0));
     clip.text(Pos2::new(r.left() + 16.0, r.bottom() - 36.0), Align2::LEFT_CENTER, title, FontId::proportional(19.0), Color32::WHITE);
     clip.text(Pos2::new(r.left() + 16.0, r.bottom() - 15.0), Align2::LEFT_CENTER, sub, FontId::proportional(12.0), Color32::from_white_alpha(205));
     play_bubble(p, th, Pos2::new(r.right() - 32.0, r.bottom() - 32.0 + 6.0 * (1.0 - k)), k);
@@ -1188,6 +1189,20 @@ impl Rustym {
         let _ = app.cmd.send(Cmd::SetRepeat(app.cfg.repeat));
         let _ = app.cmd.send(Cmd::Autoplay(app.cfg.autoplay));
         let _ = app.cmd.send(Cmd::SetFx(app.cfg.fx.clone()));
+        // Restore the preferred start page from Settings.
+        match app.cfg.start_view {
+            1 => {
+                app.view = View::Search;
+                app.label = "Search".into();
+                app.focus_once = true;
+            }
+            2 => {
+                app.view = View::Liked;
+                app.label = "Liked songs".into();
+                app.load_liked(&cc.egui_ctx);
+            }
+            _ => {}
+        }
         app.fetch_home(&cc.egui_ctx);
         if signed {
             app.fetch_liked_ids(&cc.egui_ctx);
@@ -2470,6 +2485,32 @@ impl Rustym {
             }
             return;
         }
+        // Hero card: count and a one-click Play all.
+        egui::Frame::none().fill(th.card).rounding(20.0).inner_margin(Margin::same(20.0)).show(ui, |ui| {
+            let p = ui.painter();
+            let r = ui.max_rect();
+            p.circle_filled(r.right_top() - Vec2::new(20.0, 20.0), 120.0, th.accent.gamma_multiply(0.05));
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("Your liked songs").font(serif_id(26.0)).color(th.text));
+                    ui.label(
+                        RichText::new(format!("{} songs · synced from YouTube Music", self.tracks.len()))
+                            .size(12.5)
+                            .color(th.dim),
+                    );
+                });
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if self.pill(ui, "⤮  Shuffle all", false).clicked() {
+                        let _ = self.cmd.send(Cmd::Shuffle(true));
+                        let _ = self.cmd.send(Cmd::Play(self.tracks.clone(), 0));
+                    }
+                    if ui.add(pages::play_pill(th, "▶  Play all")).clicked() {
+                        let _ = self.cmd.send(Cmd::Play(self.tracks.clone(), 0));
+                    }
+                });
+            });
+        });
+        ui.add_space(12.0);
         let cur = self.snap.current.as_ref().map(|c| c.id.clone());
         let act = draw_tracks(ui, th, &self.tracks, cur.as_deref(), self.yt_removable(), &self.liked_ids);
         self.handle_act(act, None);
@@ -2481,22 +2522,25 @@ impl Rustym {
         ui.add_space(12.0);
         let mut create = false;
         ui.horizontal(|ui| {
-            let w = ui.available_width() - 120.0;
-            let r = ui.scope(|ui| {
-                ui.spacing_mut().interact_size.y = 38.0;
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.new_pl)
-                        .hint_text("New playlist name…")
-                        .desired_width(w),
-                )
+            ui.allocate_ui_with_layout(Vec2::new(460.0, 44.0), Layout::left_to_right(Align::Center), |ui| {
+                egui::Frame::none().fill(th.card).rounding(22.0).inner_margin(Margin::symmetric(16.0, 8.0)).show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.new_pl)
+                            .hint_text("New playlist name…")
+                            .frame(false)
+                            .font(FontId::proportional(15.0))
+                            .desired_width(400.0),
+                    );
+                });
             });
-            if r.inner.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                create = true;
-            }
-            if ui.add_sized([110.0, 38.0], accent_button(th, "Create")).clicked() {
+            if ui.add_sized([120.0, 44.0], accent_button(th, "Create")).clicked() {
                 create = true;
             }
         });
+        let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+        if enter && !self.new_pl.trim().is_empty() {
+            create = true;
+        }
         if create && !self.new_pl.trim().is_empty() {
             self.cfg.playlists.push(Playlist { name: self.new_pl.trim().to_string(), tracks: vec![] });
             self.new_pl.clear();
@@ -2789,206 +2833,290 @@ impl Rustym {
         }
     }
 
+    /// A titled settings section rendered as one rounded card.
+    fn settings_group(ui: &mut egui::Ui, th: Theme, title: &str, f: impl FnOnce(&mut egui::Ui)) {
+        egui::Frame::none().fill(th.card).rounding(16.0).inner_margin(Margin::same(18.0)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(title).font(serif_id(18.0)).color(th.text));
+            ui.add_space(8.0);
+            f(ui);
+        });
+        ui.add_space(10.0);
+    }
+
+    /// Checkbox row with a short description underneath.
+    fn settings_toggle(ui: &mut egui::Ui, th: Theme, on: &mut bool, title: &str, sub: &str) -> bool {
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            if ui.checkbox(on, RichText::new(title).size(14.0).color(th.text)).changed() {
+                changed = true;
+            }
+        });
+        if !sub.is_empty() {
+            ui.label(RichText::new(sub).size(11.5).color(th.dim));
+        }
+        ui.add_space(6.0);
+        changed
+    }
+
     fn page_settings(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let th = self.theme;
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.add_space(4.0);
+            ui.add_space(2.0);
 
-            ui.label(RichText::new("Theme").size(16.0).strong().color(th.text));
-            ui.add_space(6.0);
-            let mut pick = None;
-            ui.horizontal_wrapped(|ui| {
-                for (i, t) in THEMES.iter().enumerate() {
-                    let (rect, resp) = ui.allocate_exact_size(Vec2::new(116.0, 64.0), Sense::click());
-                    let sel = self.cfg.theme == i;
-                    let p = ui.painter();
-                    p.rect_filled(rect, 12.0, t.panel);
-                    p.rect_stroke(rect, 12.0, Stroke::new(if sel { 2.0_f32 } else { 1.0_f32 }, if sel { t.accent } else { t.card2 }));
-                    p.circle_filled(Pos2::new(rect.left() + 22.0, rect.center().y), 9.0, t.accent);
-                    p.text(Pos2::new(rect.left() + 38.0, rect.center().y), Align2::LEFT_CENTER, t.name,
-                           FontId::proportional(14.0), t.text);
-                    if resp.hovered() {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            // ---------- Appearance ----------
+            Self::settings_group(ui, th, "Appearance", |ui| {
+                let mut pick = None;
+                ui.horizontal_wrapped(|ui| {
+                    for (i, t) in THEMES.iter().enumerate() {
+                        let (rect, resp) = ui.allocate_exact_size(Vec2::new(112.0, 56.0), Sense::click());
+                        let sel = self.cfg.theme == i;
+                        let p = ui.painter();
+                        p.rect_filled(rect, 12.0, t.panel);
+                        p.rect_stroke(rect, 12.0, Stroke::new(if sel { 2.0_f32 } else { 1.0_f32 }, if sel { t.accent } else { t.card2 }));
+                        p.circle_filled(Pos2::new(rect.left() + 22.0, rect.center().y), 9.0, t.accent);
+                        p.text(Pos2::new(rect.left() + 38.0, rect.center().y), Align2::LEFT_CENTER, t.name,
+                               FontId::proportional(13.5), t.text);
+                        if resp.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if resp.clicked() {
+                            pick = Some(i);
+                        }
                     }
-                    if resp.clicked() {
-                        pick = Some(i);
-                    }
+                });
+                if let Some(i) = pick {
+                    self.cfg.theme = i;
+                    self.theme = THEMES[i];
+                    apply_theme(ctx, &self.theme);
+                    self.cfg.save();
                 }
-            });
-            if let Some(i) = pick {
-                self.cfg.theme = i;
-                self.theme = THEMES[i];
-                apply_theme(ctx, &self.theme);
-                self.cfg.save();
-            }
-
-            ui.add_space(22.0);
-            ui.label(RichText::new("Visualiser style").size(16.0).strong().color(th.text));
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                for (i, n) in ["Bars", "Mirror", "Radial"].iter().enumerate() {
-                    if ui.selectable_value(&mut self.cfg.viz, i, *n).changed() {
-                        self.cfg.save();
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Interface scale").size(13.5).color(th.dim2));
+                    ui.add_sized([260.0, 26.0], egui::Slider::new(&mut self.cfg.ui_scale, 80.0..=125.0).suffix("%").show_value(true));
+                    if ui.input(|i| i.pointer.any_released()) || ui.ctx().input(|i| i.time) as i64 != 0 {
+                        // saved on release below
                     }
+                    ctx.request_repaint();
+                });
+                if ui.input(|i| i.pointer.any_released()) {
+                    self.cfg.save();
                 }
-            });
-
-            ui.add_space(22.0);
-            ui.label(RichText::new("Interface & accessibility").size(16.0).strong().color(th.text));
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.label("Interface scale");
-                let scale = ui.add(egui::Slider::new(&mut self.cfg.ui_scale, 80.0..=125.0).suffix("%").show_value(true));
-                if scale.changed() {
-                    ctx.set_zoom_factor((self.cfg.ui_scale / 100.0).clamp(0.80, 1.25));
+                if Self::settings_toggle(ui, th, &mut self.cfg.compact_mode, "Compact layout", "Tighter spacing and smaller controls everywhere.") {
                     self.cfg.save();
                 }
             });
-            if ui.checkbox(&mut self.cfg.compact_mode, "Compact layout (tighter spacing and controls)").changed() {
-                self.cfg.save();
-            }
-            if ui.checkbox(&mut self.cfg.auto_show_lyrics, "Keep Lyrics enabled when Rustym starts").changed() {
-                self.lyrics_enabled = self.cfg.auto_show_lyrics;
-                self.cfg.save();
-            }
-            ui.label(RichText::new("Scale and layout changes apply immediately and are saved for your next session. The Lyrics button also updates the startup preference.").size(12.0).color(th.dim));
 
-            ui.add_space(22.0);
-            ui.label(RichText::new("Account").size(16.0).strong().color(th.text));
-            ui.add_space(6.0);
-            if self.cfg.signed_in {
+            // ---------- Playback & startup ----------
+            Self::settings_group(ui, th, "Playback & startup", |ui| {
+                ui.label(RichText::new("Show this page when Rustym starts").size(13.5).color(th.dim2));
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    account_avatar(ui, th, &self.cfg.account_photo, &self.cfg.account_name, 44.0);
-                    ui.vertical(|ui| {
-                        let nm = if self.cfg.account_name.is_empty() { "Signed in to Google" } else { self.cfg.account_name.as_str() };
-                        ui.label(RichText::new(nm).size(15.0).strong().color(th.text));
-                        ui.label(RichText::new("● Signed in").size(12.0).color(th.accent));
+                    for (i, name) in ["Home", "Search", "Liked songs"].iter().enumerate() {
+                        if self.pill(ui, name, self.cfg.start_view == i as u8).clicked() {
+                            self.cfg.start_view = i as u8;
+                            self.cfg.save();
+                        }
+                    }
+                });
+                ui.add_space(10.0);
+                if Self::settings_toggle(ui, th, &mut self.cfg.autoplay, "Autoplay", "Keep the queue going with YouTube Music radio when it ends.") {
+                    let _ = self.cmd.send(Cmd::Autoplay(self.cfg.autoplay));
+                    self.cfg.save();
+                }
+                ui.label(RichText::new("Visualiser style").size(13.5).color(th.dim2));
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    for (i, n) in ["Bars", "Mirror", "Radial"].iter().enumerate() {
+                        if self.pill(ui, n, self.cfg.viz == i).clicked() {
+                            self.cfg.viz = i;
+                            self.cfg.save();
+                        }
+                    }
+                });
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Lyrics timing offset").size(13.5).color(th.dim2));
+                    if ui
+                        .add_sized([240.0, 24.0], egui::Slider::new(&mut self.cfg.lyrics_offset, -3000..=3000).suffix(" ms"))
+                        .drag_stopped()
+                    {
+                        self.cfg.save();
+                    }
+                });
+                ui.label(RichText::new("Tempo, pitch, equaliser, reverb, normalisation and the sleep timer are under “Sound” in the player bar.").size(11.5).color(th.dim));
+            });
+
+            // ---------- Interface & window ----------
+            Self::settings_group(ui, th, "Interface & window", |ui| {
+                if Self::settings_toggle(ui, th, &mut self.cfg.auto_show_lyrics, "Keep Lyrics enabled on startup", "The Lyrics button also updates this preference.") {
+                    self.lyrics_enabled = self.cfg.auto_show_lyrics;
+                    self.cfg.save();
+                }
+                if Self::settings_toggle(ui, th, &mut self.cfg.background, "Close to tray", "Closing the window keeps the music playing in the background (X11 and Wayland alike).") {
+                    self.cfg.save();
+                }
+                if self.cfg.background {
+                    let (txt, col) = if self.tray_ok {
+                        ("● Tray icon available".to_string(), th.dim)
+                    } else {
+                        (
+                            format!(
+                                "● No system tray detected: the window still closes and music keeps playing; reopen it by launching Rustym again or running `rustym --show`. {}",
+                                distro::tray_advice()
+                            ),
+                            th.accent,
+                        )
+                    };
+                    ui.label(RichText::new(txt).size(12.0).color(col));
+                }
+                if Self::settings_toggle(ui, th, &mut self.cfg.start_minimised, "Start minimised", "Restore from the tray or task switcher when you need the window.") {
+                    self.cfg.save();
+                }
+                let auto_before = self.cfg.start_at_login;
+                if Self::settings_toggle(ui, th, &mut self.cfg.start_at_login, "Launch automatically at sign-in", "Uses your desktop's XDG autostart entry.") {
+                    match set_desktop_autostart(self.cfg.start_at_login) {
+                        Ok(()) => {
+                            self.cfg.save();
+                            self.toast = Some((if self.cfg.start_at_login { "Desktop auto-start enabled" } else { "Desktop auto-start disabled" }.into(), Instant::now()));
+                        }
+                        Err(e) => {
+                            self.cfg.start_at_login = auto_before;
+                            self.toast = Some((format!("Could not update auto-start: {e}"), Instant::now()));
+                        }
+                    }
+                }
+                ui.label(RichText::new("Control from a terminal or keybindings: rustym --toggle | --play-pause | --next | --prev | --quit").size(11.5).color(th.dim));
+            });
+
+            // ---------- Account ----------
+            Self::settings_group(ui, th, "Account", |ui| {
+                if self.cfg.signed_in {
+                    ui.horizontal(|ui| {
+                        account_avatar(ui, th, &self.cfg.account_photo, &self.cfg.account_name, 44.0);
+                        ui.vertical(|ui| {
+                            let nm = if self.cfg.account_name.is_empty() { "Signed in to Google" } else { self.cfg.account_name.as_str() };
+                            ui.label(RichText::new(nm).size(15.0).strong().color(th.text));
+                            ui.label(RichText::new("● Signed in").size(12.0).color(th.accent));
+                        });
+                        ui.add_space(10.0);
+                        if ui.button("Sign out").clicked() {
+                            self.sign_out();
+                        }
                     });
-                    ui.add_space(10.0);
-                    if ui.button("Sign out").clicked() {
-                        self.sign_out();
-                    }
-                });
-            } else if self.login_waiting {
-                ui.horizontal(|ui| {
-                    spin(ui, th);
-                    ui.label(RichText::new("Waiting for you to finish signing in…").color(th.dim));
-                    if ui.button("Cancel").clicked() {
-                        self.cancel_login();
-                    }
-                });
-            } else {
-                ui.horizontal(|ui| {
-                    if ui.add(accent_button(th, "Sign in with Google")).clicked() {
-                        self.start_login(ctx);
-                    }
-                    if ui.button("Use cookies.txt").clicked() {
-                        self.use_cookie_file(ctx);
-                    }
-                });
-            }
-            if !self.login_msg.is_empty() {
-                ui.label(RichText::new(&self.login_msg).size(12.0).color(th.accent));
-            }
-
-            ui.add_space(22.0);
-            ui.label(RichText::new("Playback").size(16.0).strong().color(th.text));
-            ui.add_space(6.0);
-            if ui.checkbox(&mut self.cfg.autoplay, "Autoplay: keep the queue going with YouTube Music radio").changed() {
-                let _ = self.cmd.send(Cmd::Autoplay(self.cfg.autoplay));
-                self.cfg.save();
-            }
-            ui.horizontal(|ui| {
-                ui.label("Lyrics timing");
-                if ui.add(egui::Slider::new(&mut self.cfg.lyrics_offset, -3000..=3000).suffix(" ms")).drag_stopped() {
-                    self.cfg.save();
-                }
-            });
-            ui.label(RichText::new("Tempo, pitch, equaliser, reverb, normalisation and the sleep timer are under “Sound” in the player bar.").size(12.0).color(th.dim));
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui.button("Export local playlists").clicked() {
-                    self.export_playlists();
-                }
-                if ui.button("Import local playlists").clicked() {
-                    self.import_playlists();
-                }
-                if ui.button("Clear listening stats").clicked() {
-                    store::clear();
-                    self.toast = Some(("Listening stats cleared".into(), Instant::now()));
-                }
-            });
-            ui.label(RichText::new(format!("Export/import file: {}", config_dir().join("playlists-export.json").display())).size(12.0).color(th.dim));
-
-            ui.add_space(22.0);
-            ui.label(RichText::new("Window").size(16.0).strong().color(th.text));
-            ui.add_space(6.0);
-            if ui
-                .checkbox(&mut self.cfg.background, "Close to tray: closing the window keeps the music playing in the background")
-                .changed()
-            {
-                self.cfg.save();
-            }
-            ui.label(
-                RichText::new("The window is really closed (not just hidden), on X11 and Wayland alike. The tray icon, launching Rustym again, or `rustym --show` brings it back.")
-                    .size(12.0)
-                    .color(th.dim),
-            );
-            if self.cfg.background {
-                let (txt, col) = if self.tray_ok {
-                    ("● Tray icon available".to_string(), th.dim)
+                } else if self.login_waiting {
+                    ui.horizontal(|ui| {
+                        spin(ui, th);
+                        ui.label(RichText::new("Waiting for you to finish signing in…").color(th.dim));
+                        if ui.button("Cancel").clicked() {
+                            self.cancel_login();
+                        }
+                    });
                 } else {
-                    (
-                        format!(
-                            "● No system tray detected: the window still closes and music keeps playing; reopen it by launching Rustym again or running `rustym --show`. {}",
-                            distro::tray_advice()
-                        ),
-                        th.accent,
-                    )
-                };
-                ui.label(RichText::new(txt).size(12.0).color(col));
-            }
-            ui.label(RichText::new("Control from a terminal or keybindings: rustym --toggle | --play-pause | --next | --prev | --quit").size(12.0).color(th.dim));
-            ui.add_space(10.0);
-            if ui.checkbox(&mut self.cfg.start_minimised, "Start minimised (restore from the tray or task switcher)").changed() {
-                self.cfg.save();
-            }
-            let auto_before = self.cfg.start_at_login;
-            if ui.checkbox(&mut self.cfg.start_at_login, "Launch Rustym automatically when I sign in to this desktop").changed() {
-                match set_desktop_autostart(self.cfg.start_at_login) {
-                    Ok(()) => {
-                        self.cfg.save();
-                        self.toast = Some((if self.cfg.start_at_login { "Desktop auto-start enabled" } else { "Desktop auto-start disabled" }.into(), Instant::now()));
-                    }
-                    Err(e) => {
-                        self.cfg.start_at_login = auto_before;
-                        self.toast = Some((format!("Could not update auto-start: {e}"), Instant::now()));
-                    }
+                    ui.horizontal(|ui| {
+                        if ui.add(accent_button(th, "Sign in with Google")).clicked() {
+                            self.start_login(ctx);
+                        }
+                        if ui.button("Use cookies.txt").clicked() {
+                            self.use_cookie_file(ctx);
+                        }
+                    });
                 }
-            }
-            ui.label(RichText::new("Auto-start uses your desktop's XDG autostart entry. Start minimised takes effect the next time Rustym opens.").size(12.0).color(th.dim));
+                if !self.login_msg.is_empty() {
+                    ui.add_space(8.0);
+                    ui.label(RichText::new(&self.login_msg).size(12.0).color(th.accent));
+                }
+            });
 
-            ui.add_space(22.0);
-            ui.label(RichText::new("Liked songs").size(16.0).strong().color(th.text));
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new("Your liked songs are saved on this computer, so the Liked page opens instantly and works offline. They refresh in the background every time you open it.")
-                    .size(12.0)
-                    .color(th.dim),
-            );
-            if ui.button("Clear saved liked songs").clicked() {
-                liked_cache_clear();
-                self.toast = Some(("Saved liked songs cleared".into(), Instant::now()));
-            }
+            // ---------- Maintenance ----------
+            Self::settings_group(ui, th, "Maintenance", |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add(accent_button(th, "Update yt-dlp")).clicked() {
+                        self.toast = Some(("Updating yt-dlp…".into(), Instant::now()));
+                        self.bg(ctx, || {
+                            let out = std::process::Command::new("yt-dlp").arg("-U").output();
+                            match out {
+                                Ok(o) => {
+                                    let s = format!(
+                                        "{}{}",
+                                        String::from_utf8_lossy(&o.stdout),
+                                        String::from_utf8_lossy(&o.stderr)
+                                    );
+                                    let last = s.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").to_string();
+                                    if o.status.success() {
+                                        Msg::Toast(format!("yt-dlp: {last}"))
+                                    } else {
+                                        Msg::Toast(format!("yt-dlp -U failed: {last}"))
+                                    }
+                                }
+                                Err(e) => Msg::Toast(format!("yt-dlp -U failed: {e}")),
+                            }
+                        });
+                    }
+                    if ui.button("Clear artwork cache").clicked() {
+                        self.img.forget_all();
+                        let loaders = ctx.loaders();
+                        loaders.include.forget_all();
+                        for b in loaders.bytes.lock().iter() {
+                            b.forget_all();
+                        }
+                        for l in loaders.texture.lock().iter() {
+                            l.forget_all();
+                        }
+                        self.toast = Some(("Artwork cache cleared".into(), Instant::now()));
+                    }
+                    if ui.button("Clear saved liked songs").clicked() {
+                        liked_cache_clear();
+                        self.toast = Some(("Saved liked songs cleared".into(), Instant::now()));
+                    }
+                    if ui.button("Export local playlists").clicked() {
+                        self.export_playlists();
+                    }
+                    if ui.button("Import local playlists").clicked() {
+                        self.import_playlists();
+                    }
+                    if ui.button("Clear listening stats").clicked() {
+                        store::clear();
+                        self.toast = Some(("Listening stats cleared".into(), Instant::now()));
+                    }
+                });
+                ui.add_space(6.0);
+                ui.label(RichText::new("The artwork cache keeps decoded cover art in RAM bounded; clearing it frees memory immediately if Rustym has been open for days.").size(11.5).color(th.dim));
+                ui.label(RichText::new(format!("Playlists export file: {}", config_dir().join("playlists-export.json").display())).size(11.5).color(th.dim));
+            });
 
-            ui.add_space(22.0);
-            if ui.button("Quit Rustym").clicked() {
-                self.cfg.save();
-                let _ = self.cmd.send(Cmd::Quit);
-            }
+            // ---------- About ----------
+            Self::settings_group(ui, th, "About", |ui| {
+                ui.label(
+                    RichText::new(format!("Rustym v{}", env!("CARGO_PKG_VERSION")))
+                        .font(serif_id(19.0))
+                        .color(th.text),
+                );
+                ui.label(RichText::new("An ad-free YouTube Music player for Linux — pure Rust + egui on top of mpv and yt-dlp.").size(12.0).color(th.dim));
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("License: GNU GPL v3.0").size(12.0).color(th.dim2));
+                    let repo = "https://github.com/Jagan-Srinivasan/Rustym";
+                    if ui.button("Copy project link").clicked() {
+                        ui.ctx().copy_text(repo.to_string());
+                        self.toast = Some(("Project link copied".into(), Instant::now()));
+                    }
+                });
+                ui.label(
+                    RichText::new("Rustym is an unofficial third-party client. Not affiliated with or endorsed by Google or YouTube. Thanks to mpv, yt-dlp, egui and LRCLIB.")
+                        .size(11.5)
+                        .color(th.dim),
+                );
+                ui.add_space(8.0);
+                if ui.button("Quit Rustym").clicked() {
+                    self.cfg.save();
+                    let _ = self.cmd.send(Cmd::Quit);
+                }
+            });
         });
     }
-
+    
     fn main_panel(&mut self, ctx: &egui::Context) {
         let th = self.theme;
         egui::CentralPanel::default()
@@ -3047,6 +3175,10 @@ impl Rustym {
             }
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                // The Search page has its own input; don't show the pill twice.
+                if self.view == View::Search {
+                    return;
+                }
                 let w = (ui.available_width() * 0.42).clamp(240.0, 420.0);
                 let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 34.0), Sense::click());
                 let p = ui.painter();

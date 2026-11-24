@@ -23,7 +23,7 @@ fn glow_art(ui: &mut egui::Ui, th: Theme, id: &str, art: Rect) {
 }
 
 /// Big rounded accent pill for Play / Pause (the hero action button).
-fn play_pill(th: Theme, label: &str) -> egui::Button<'static> {
+pub(crate) fn play_pill(th: Theme, label: &str) -> egui::Button<'static> {
     let fg = if th.light { Color32::WHITE } else { Color32::from_rgb(20, 15, 11) };
     egui::Button::new(RichText::new(label.to_string()).size(14.5).strong().color(fg))
         .fill(th.accent)
@@ -53,7 +53,9 @@ fn ring_btn(ui: &mut egui::Ui, th: Theme, glyph: &str, active: bool) -> egui::Re
 /// mini equaliser underneath fed by the live audio levels.
 fn vinyl(ui: &mut egui::Ui, th: Theme, size: f32, playing: bool, levels: &[f32]) {
     let (rect, _) = ui.allocate_exact_size(Vec2::new(size, size + 64.0), Sense::hover());
-    let p = ui.painter();
+    // Clip everything to the allocated rect so the record can never spill
+    // outside the Now Playing card.
+    let p = ui.painter_at(rect);
     let c = Pos2::new(rect.center().x, rect.top() + size / 2.0);
     let r = size / 2.0;
     // Record body + grooves
@@ -128,7 +130,7 @@ impl Rustym {
     // ---------------- small helpers ----------------
 
     /// Runs `f` on a worker thread and posts its message back to the UI.
-    fn bg(&self, ctx: &egui::Context, f: impl FnOnce() -> Msg + Send + 'static) {
+    pub(crate) fn bg(&self, ctx: &egui::Context, f: impl FnOnce() -> Msg + Send + 'static) {
         let tx = self.msg_tx.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
@@ -294,6 +296,12 @@ impl Rustym {
         self.loading = true;
         self.status.clear();
         self.label = format!("Results for “{q}”");
+        // Remember the query for the recent-searches chips.
+        if !self.cfg.recent_queries.iter().any(|s| s == &q) {
+            self.cfg.recent_queries.insert(0, q.clone());
+            self.cfg.recent_queries.truncate(8);
+            self.cfg.save();
+        }
         self.req += 1;
         let id = self.req;
         let filter = self.sfilter;
@@ -817,10 +825,10 @@ impl Rustym {
         let mut go = false;
         let mut pick: Option<String> = None;
         ui.horizontal(|ui| {
-            let w = ui.available_width() - 96.0;
+            let w = (ui.available_width() - 130.0).min(760.0);
             let resp = ui
                 .scope(|ui| {
-                    ui.spacing_mut().interact_size.y = 40.0;
+                    ui.spacing_mut().interact_size.y = 44.0;
                     ui.add(
                         egui::TextEdit::singleline(&mut self.query)
                             .hint_text("Search songs, albums, artists — or paste a YouTube link…")
@@ -841,7 +849,7 @@ impl Rustym {
             if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                 go = true;
             }
-            if ui.add_sized([80.0, 40.0], accent_button(th, "Search")).clicked() {
+            if ui.add_sized([110.0, 44.0], accent_button(th, "Search")).clicked() {
                 go = true;
             }
         });
@@ -864,9 +872,26 @@ impl Rustym {
         }
         if self.show_sug && !self.suggestions.is_empty() {
             ui.add_space(4.0);
-            egui::Frame::none().fill(th.card).rounding(10.0).inner_margin(Margin::symmetric(10.0, 6.0)).show(ui, |ui| {
+            egui::Frame::none().fill(th.card).rounding(12.0).inner_margin(Margin::symmetric(6.0, 6.0)).show(ui, |ui| {
+                ui.set_width(ui.available_width().min(560.0));
                 for s in self.suggestions.iter() {
-                    if ui.add(egui::Button::new(RichText::new(s).size(14.0).color(th.text)).frame(false)).clicked() {
+                    ui.horizontal(|ui| {
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("⌕").color(th.dim));
+                        if ui.add(egui::Button::new(RichText::new(s).size(14.5).color(th.text)).frame(false)).clicked() {
+                            pick = Some(s.clone());
+                        }
+                    });
+                }
+            });
+        } else if self.show_sug && self.query.trim().is_empty() && !self.cfg.recent_queries.is_empty() {
+            // No typing yet: offer recent searches instead of an empty box.
+            ui.add_space(4.0);
+            ui.label(RichText::new("RECENT SEARCHES").size(9.5).strong().color(th.dim));
+            ui.add_space(2.0);
+            ui.horizontal_wrapped(|ui| {
+                for s in self.cfg.recent_queries.iter().take(8) {
+                    if self.pill(ui, s, false).clicked() {
                         pick = Some(s.clone());
                     }
                 }
@@ -1383,15 +1408,10 @@ impl Rustym {
                     ui.add_space(6.0);
                     ui.label(RichText::new("N O W   P L A Y I N G").size(10.0).strong().color(th.accent));
                     ui.add_space(8.0);
-                    ui.add(
-                        egui::Label::new(RichText::new(&t.title).font(serif_id(40.0)).color(th.text))
-                            .wrap_mode(egui::TextWrapMode::Truncate),
-                    );
+                    // Title and artist wrap so long names are never cut off.
+                    ui.add(egui::Label::new(RichText::new(&t.title).font(serif_id(36.0)).color(th.text)));
                     ui.add_space(6.0);
-                    ui.add(
-                        egui::Label::new(RichText::new(&t.artist).font(serif_italic_id(21.0)).color(th.dim2))
-                            .wrap_mode(egui::TextWrapMode::Truncate),
-                    );
+                    ui.add(egui::Label::new(RichText::new(&t.artist).font(serif_italic_id(20.0)).color(th.dim2)));
                     ui.add_space(12.0);
                     // Meta row: like state · album
                     let mut meta = if liked { "♥  Liked".to_string() } else { String::new() };
@@ -1428,7 +1448,22 @@ impl Rustym {
                         }
                     });
                     ui.add_space(14.0);
-                    if s.snap.loading {
+                    // Status anchored to the bottom of the column when the card is
+                    // expanded, so no dead space is left under the actions.
+                    if expanded_height {
+                        ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
+                            if s.snap.loading {
+                                ui.horizontal(|ui| {
+                                    spin(ui, th);
+                                    ui.label(RichText::new("Preparing your track…").size(12.5).color(th.dim));
+                                });
+                            } else if s.snap.paused {
+                                ui.label(RichText::new("Paused").size(12.5).color(th.dim));
+                            } else {
+                                ui.label(RichText::new("Enjoying your music").size(12.5).color(th.dim));
+                            }
+                        });
+                    } else if s.snap.loading {
                         ui.horizontal(|ui| {
                             spin(ui, th);
                             ui.label(RichText::new("Preparing your track…").size(12.5).color(th.dim));
@@ -1453,7 +1488,7 @@ impl Rustym {
                         });
                         ui.add_space(12.0);
                         ui.allocate_ui_with_layout(Vec2::new(right_width, column_height), Layout::top_down(Align::Center), |ui| {
-                            let vsize = right_width.min(column_height - 60.0).max(220.0);
+                            let vsize = right_width.min(column_height - 90.0).max(150.0);
                             let disp = self.disp.clone();
                             vinyl(ui, th, vsize, playing, &disp);
                         });

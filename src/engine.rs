@@ -127,6 +127,10 @@ pub struct Config {
     pub start_at_login: bool,
     pub playlists: Vec<Playlist>,
     pub recent: Vec<Track>,
+    /// Page shown when Rustym starts: 0 Home, 1 Search, 2 Liked songs.
+    pub start_view: u8,
+    /// Last search queries, offered as one-tap chips on the Search page.
+    pub recent_queries: Vec<String>,
     pub trending: Vec<Track>,
     pub remote: Vec<RemotePl>,
     pub fx: Fx,
@@ -157,6 +161,8 @@ impl Default for Config {
             start_at_login: false,
             playlists: vec![],
             recent: vec![],
+            start_view: 0,
+            recent_queries: vec![],
             trending: vec![],
             remote: vec![],
             fx: Fx::default(),
