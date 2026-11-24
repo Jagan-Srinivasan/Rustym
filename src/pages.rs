@@ -14,54 +14,86 @@ fn fmt_hms(secs: f64) -> String {
     }
 }
 
-/// Live status chip: a pulsing dot + label (Loading / Paused / Playing).
-fn status_chip(ui: &mut egui::Ui, th: Theme, loading: bool, paused: bool) {
-    let (text, dot, pulse) = if loading {
-        ("Loading", th.accent, true)
-    } else if paused {
-        ("Paused", th.dim, false)
-    } else {
-        ("Playing", th.accent, false)
-    };
-    egui::Frame::none()
-        .fill(th.panel)
-        .rounding(9.0)
-        .inner_margin(Margin::symmetric(9.0, 3.0))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let (rect, _) = ui.allocate_exact_size(Vec2::new(9.0, 9.0), Sense::hover());
-                let a = if pulse {
-                    let t = ui.input(|i| i.time);
-                    0.35 + 0.65 * (0.5 + 0.5 * (t as f32 * 3.0).sin())
-                } else {
-                    1.0
-                };
-                ui.painter().circle_filled(rect.center(), 3.2, dot.gamma_multiply(a));
-                ui.label(RichText::new(text).size(11.0).color(th.dim2));
-            });
-        });
-}
-
-/// Rounded album pill with a music note.
-fn album_chip(ui: &mut egui::Ui, th: Theme, album: &str) {
-    egui::Frame::none()
-        .fill(th.panel)
-        .rounding(10.0)
-        .inner_margin(Margin::symmetric(9.0, 4.0))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("♪").size(11.0).color(th.accent));
-                ui.label(RichText::new(album).size(12.0).color(th.dim2));
-            });
-        });
-}
-
 /// Artwork with a soft accent glow ring behind it.
 fn glow_art(ui: &mut egui::Ui, th: Theme, id: &str, art: Rect) {
     let p = ui.painter();
     p.rect_filled(art.expand(6.0), 22.0, th.accent.gamma_multiply(0.14));
     p.rect_filled(art.expand(2.0), 20.0, th.accent.gamma_multiply(0.28));
     thumb(ui, id, art, 18.0);
+}
+
+/// Big rounded accent pill for Play / Pause (the hero action button).
+fn play_pill(th: Theme, label: &str) -> egui::Button<'static> {
+    let fg = if th.light { Color32::WHITE } else { Color32::from_rgb(20, 15, 11) };
+    egui::Button::new(RichText::new(label.to_string()).size(14.5).strong().color(fg))
+        .fill(th.accent)
+        .rounding(15.0)
+}
+
+/// Small outlined circle button (heart / lyrics / visualiser / queue).
+fn ring_btn(ui: &mut egui::Ui, th: Theme, glyph: &str, active: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::click());
+    let k = ui.ctx().animate_bool(resp.id, resp.hovered());
+    let p = ui.painter();
+    let c = rect.center();
+    if active {
+        p.circle_filled(c, 19.0, th.accent.gamma_multiply(0.14));
+    } else if k > 0.01 {
+        p.circle_filled(c, 19.0, th.accent.gamma_multiply(0.07 * k));
+    }
+    p.circle_stroke(c, 19.5, Stroke::new(1.4_f32, if active { th.accent } else { th.dim2.gamma_multiply(0.7 + 0.3 * k) }));
+    p.text(c, Align2::CENTER_CENTER, glyph, FontId::proportional(15.0), if active { th.accent } else { lerp_col(th.dim2, th.text, k) });
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp
+}
+
+/// A vinyl record with grooves, a slowly rotating sheen while playing, and a
+/// mini equaliser underneath fed by the live audio levels.
+fn vinyl(ui: &mut egui::Ui, th: Theme, size: f32, playing: bool, levels: &[f32]) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(size, size + 64.0), Sense::hover());
+    let p = ui.painter();
+    let c = Pos2::new(rect.center().x, rect.top() + size / 2.0);
+    let r = size / 2.0;
+    // Record body + grooves
+    p.circle_filled(c, r, Color32::from_rgb(13, 11, 9));
+    for i in 1..7 {
+        let rr = r * (0.28 + 0.68 * i as f32 / 7.0);
+        p.circle_stroke(c, rr, Stroke::new(1.0_f32, Color32::from_white_alpha(9)));
+    }
+    p.circle_stroke(c, r - 1.0, Stroke::new(1.2_f32, th.accent.gamma_multiply(0.10)));
+    // Sheen wedge rotating while playing
+    let t = ui.ctx().input(|i| i.time) as f32;
+    let a0 = if playing { t * 0.9 } else { 0.6 };
+    for k in 0..10 {
+        let a = a0 + k as f32 * 0.05;
+        let (s, co) = a.sin_cos();
+        let r1 = r * 0.34;
+        let r2 = r * (0.88 + 0.03 * (k % 3) as f32);
+        let fade = (1.0 - k as f32 / 10.0) * 0.10;
+        p.line_segment(
+            [Pos2::new(c.x + co * r1, c.y + s * r1), Pos2::new(c.x + co * r2, c.y + s * r2)],
+            Stroke::new(2.0_f32, Color32::from_white_alpha((fade * 255.0) as u8)),
+        );
+    }
+    // Centre label in the accent colour, with a spindle hole.
+    p.circle_filled(c, r * 0.26, th.accent);
+    p.circle_stroke(c, r * 0.26, Stroke::new(1.0_f32, Color32::from_black_alpha(32)));
+    p.circle_filled(c, r * 0.035, Color32::from_rgb(13, 11, 9));
+
+    // Mini equaliser underneath.
+    let n = 32;
+    let gap = 3.0;
+    let bw = ((rect.width() - gap * (n as f32 - 1.0)) / n as f32).max(1.0);
+    let base = rect.bottom() - 30.0;
+    for i in 0..n {
+        let v = levels.get(i * BANDS / n).copied().unwrap_or(0.05);
+        let h = (v * 34.0).max(2.5);
+        let x = rect.left() + i as f32 * (bw + gap);
+        let rr = Rect::from_min_max(Pos2::new(x, base - h), Pos2::new(x + bw, base));
+        p.rect_filled(rr, bw / 2.0, th.accent.gamma_multiply(0.35 + 0.6 * v));
+    }
 }
 
 /// Album / artist / playlist / song tile with a square picture.
@@ -1295,67 +1327,39 @@ impl Rustym {
             return;
         };
 
-        ui.add_space(8.0);
-
-        // ---- header: eyebrow, live status chip, view toggles ----
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("NOW PLAYING").size(11.0).strong().color(th.accent));
-            ui.add_space(6.0);
-            status_chip(ui, th, self.snap.loading, self.snap.paused);
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let viz_label = if self.cfg.show_visualiser { "◔  Visualiser" } else { "○  Visualiser" };
-                if ui.add(egui::Button::new(RichText::new(viz_label).size(11.0).color(th.accent)).fill(th.panel).rounding(9.0)).clicked() {
-                    self.cfg.show_visualiser = !self.cfg.show_visualiser;
-                    self.cfg.save();
-                }
-                let lyr_label = if self.lyrics_enabled { "♫  Lyrics on" } else { "♫  Lyrics" };
-                if ui.add(egui::Button::new(RichText::new(lyr_label).size(11.0).color(if self.lyrics_enabled { th.text } else { th.accent })).fill(th.panel).rounding(9.0)).clicked() {
-                    self.lyrics_enabled = !self.lyrics_enabled;
-                    self.cfg.auto_show_lyrics = self.lyrics_enabled;
-                    self.cfg.save();
-                }
-            });
-        });
-        ui.add_space(14.0);
+        ui.add_space(10.0);
 
         let available = ui.available_width().max(320.0);
         let available_height = ui.available_height();
         let lyrics_shown = self.lyrics_enabled;
-        let wide_lyrics = lyrics_shown && available >= 980.0;
+        let wide = available >= 980.0;
+        let wide_lyrics = lyrics_shown && wide;
+        let show_vinyl = wide && !lyrics_shown;
         let inner_width = (available - 40.0).max(240.0);
 
         // When the visualiser is hidden, use the full vertical space left by the
-        // header and bottom player. In the wide lyrics layout, grow all three
-        // columns together instead of leaving a short row inside a tall card.
+        // header and bottom player; grow all columns together.
         let expanded_height = !self.cfg.show_visualiser;
-        let card_content_height = if expanded_height {
-            (available_height - 70.0).max(300.0)
-        } else {
-            0.0
-        };
-        let art_side = if expanded_height && wide_lyrics {
+        let card_content_height = if expanded_height { (available_height - 62.0).max(300.0) } else { 0.0 };
+        let art_side = if expanded_height && (wide_lyrics || show_vinyl) {
             ((card_content_height - 40.0).min(inner_width * 0.36)).clamp(280.0, 420.0)
         } else if available >= 900.0 {
             280.0
         } else {
             (available * 0.38).clamp(150.0, 230.0)
         };
-        let info_width = if wide_lyrics {
-            330.0_f32.min((inner_width - art_side - 330.0).max(250.0))
+        let right_width = (inner_width - art_side - 48.0).clamp(240.0, 430.0);
+        let info_width = if wide_lyrics || show_vinyl {
+            350.0_f32.min((inner_width - art_side - 300.0).max(250.0))
         } else {
             (inner_width - art_side - 28.0).max(190.0)
         };
-        let lyrics_width = (inner_width - art_side - info_width - 48.0).max(0.0);
-        let card_min_height = if expanded_height {
-            card_content_height
-        } else {
-            0.0
-        };
-        let column_height = if expanded_height {
-            card_content_height - 40.0
-        } else {
-            art_side
-        }.max(art_side);
+        let lyrics_width = if wide_lyrics { right_width } else { 0.0 };
+        let card_min_height = if expanded_height { card_content_height } else { 0.0 };
+        let column_height = if expanded_height { card_content_height - 40.0 } else { art_side }.max(art_side);
+        let playing = self.snap.playing && !self.snap.paused;
+        let liked = self.liked_ids.contains(&t.id);
+
         egui::Frame::none()
             .fill(th.card)
             .rounding(24.0)
@@ -1364,15 +1368,80 @@ impl Rustym {
                 // Ambient accent glow inside the card corners (paint only, no layout).
                 let p = ui.painter();
                 let r = ui.max_rect();
-                p.circle_filled(r.left_top() + Vec2::new(30.0, 30.0), 190.0, th.accent.gamma_multiply(0.055));
-                p.circle_filled(r.right_bottom() - Vec2::new(30.0, 30.0), 150.0, th.accent.gamma_multiply(0.045));
+                p.circle_filled(r.left_top() + Vec2::new(30.0, 30.0), 190.0, th.accent.gamma_multiply(0.05));
+                p.circle_filled(r.right_bottom() - Vec2::new(30.0, 30.0), 150.0, th.accent.gamma_multiply(0.04));
                 if card_min_height > 0.0 {
                     ui.set_min_height(card_min_height - 40.0);
                 }
-                // Constrain the card to the parent width. Every column below receives an
-                // explicit width so the lyrics can never push the window's right edge out.
                 ui.set_width(inner_width);
-                if wide_lyrics && lyrics_width >= 260.0 {
+
+                // ---------- info column (shared by every layout) ----------
+                let info_column = |ui: &mut egui::Ui, s: &mut Self, col_h: f32| {
+                    if expanded_height {
+                        ui.set_min_height(col_h);
+                    }
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("N O W   P L A Y I N G").size(10.0).strong().color(th.accent));
+                    ui.add_space(8.0);
+                    ui.add(
+                        egui::Label::new(RichText::new(&t.title).font(serif_id(40.0)).color(th.text))
+                            .wrap_mode(egui::TextWrapMode::Truncate),
+                    );
+                    ui.add_space(6.0);
+                    ui.add(
+                        egui::Label::new(RichText::new(&t.artist).font(serif_italic_id(21.0)).color(th.dim2))
+                            .wrap_mode(egui::TextWrapMode::Truncate),
+                    );
+                    ui.add_space(12.0);
+                    // Meta row: like state · album
+                    let mut meta = if liked { "♥  Liked".to_string() } else { String::new() };
+                    if !t.album.is_empty() {
+                        if !meta.is_empty() {
+                            meta.push_str("   ·   ");
+                        }
+                        meta.push_str(&t.album);
+                    }
+                    if !meta.is_empty() {
+                        ui.label(RichText::new(meta).size(13.0).color(th.dim));
+                    }
+                    ui.add_space(16.0);
+                    // Hero actions: big accent play pill + ring buttons.
+                    ui.horizontal(|ui| {
+                        let label = if playing { "❚❚  Pause" } else { "▶  Play" };
+                        if ui.add(play_pill(th, label)).clicked() {
+                            let _ = s.cmd.send(Cmd::Toggle);
+                        }
+                        if ring_btn(ui, th, "♥", liked).clicked() && t.local.is_empty() {
+                            s.toggle_like(&t);
+                        }
+                        if ring_btn(ui, th, "♫", lyrics_shown).clicked() {
+                            s.lyrics_enabled = !lyrics_shown;
+                            s.cfg.auto_show_lyrics = s.lyrics_enabled;
+                            s.cfg.save();
+                        }
+                        if ring_btn(ui, th, "◔", s.cfg.show_visualiser).clicked() {
+                            s.cfg.show_visualiser = !s.cfg.show_visualiser;
+                            s.cfg.save();
+                        }
+                        if ring_btn(ui, th, "≡", s.show_queue).clicked() {
+                            s.show_queue = !s.show_queue;
+                        }
+                    });
+                    ui.add_space(14.0);
+                    if s.snap.loading {
+                        ui.horizontal(|ui| {
+                            spin(ui, th);
+                            ui.label(RichText::new("Preparing your track…").size(12.5).color(th.dim));
+                        });
+                    } else if s.snap.paused {
+                        ui.label(RichText::new("Paused").size(12.5).color(th.dim));
+                    } else {
+                        ui.label(RichText::new("Enjoying your music").size(12.5).color(th.dim));
+                    }
+                };
+
+                if show_vinyl {
+                    // Hero: artwork | info | spinning vinyl with mini equaliser.
                     ui.horizontal_top(|ui| {
                         ui.allocate_ui_with_layout(Vec2::new(art_side, art_side), Layout::top_down(Align::Center), |ui| {
                             let (art, _) = ui.allocate_exact_size(Vec2::splat(art_side), Sense::hover());
@@ -1380,37 +1449,25 @@ impl Rustym {
                         });
                         ui.add_space(18.0);
                         ui.allocate_ui_with_layout(Vec2::new(info_width, column_height), Layout::top_down(Align::Min), |ui| {
-                            if expanded_height { ui.set_min_height(column_height); }
-                            ui.add_space(8.0);
-                            ui.label(RichText::new("NOW PLAYING").size(10.0).strong().color(th.accent));
-                            ui.add_space(10.0);
-                            ui.label(RichText::new(&t.title).size(26.0).strong().color(th.text));
-                            ui.add_space(8.0);
-                            ui.label(RichText::new(&t.artist).size(15.0).color(th.dim2));
-                            if !t.album.is_empty() {
-                                ui.add_space(8.0);
-                                album_chip(ui, th, &t.album);
-                            }
-                            ui.add_space(18.0);
-                            ui.horizontal_wrapped(|ui| {
-                                let liked = self.liked_ids.contains(&t.id);
-                                if ui.add(accent_button(th, if liked { "♥  Liked" } else { "♡  Like" })).clicked() && t.local.is_empty() {
-                                    self.toggle_like(&t);
-                                }
-                                if ui.add(egui::Button::new(RichText::new(if lyrics_shown { "Hide lyrics" } else { "♫  Show lyrics" }).color(th.text)).rounding(10.0)).clicked() {
-                                    self.lyrics_enabled = !lyrics_shown;
-                                    self.cfg.auto_show_lyrics = self.lyrics_enabled;
-                                    self.cfg.save();
-                                }
-                            });
-                            ui.add_space(14.0);
-                            if self.snap.loading {
-                                ui.horizontal(|ui| { spin(ui, th); ui.label(RichText::new("Preparing your track…").size(12.0).color(th.dim)); });
-                            } else if self.snap.paused {
-                                ui.label(RichText::new("⏸  Paused").size(12.0).color(th.dim));
-                            } else {
-                                ui.label(RichText::new("Enjoying your music").size(12.0).color(th.dim));
-                            }
+                            info_column(ui, self, column_height);
+                        });
+                        ui.add_space(12.0);
+                        ui.allocate_ui_with_layout(Vec2::new(right_width, column_height), Layout::top_down(Align::Center), |ui| {
+                            let vsize = right_width.min(column_height - 60.0).max(220.0);
+                            let disp = self.disp.clone();
+                            vinyl(ui, th, vsize, playing, &disp);
+                        });
+                    });
+                } else if wide_lyrics && lyrics_width >= 260.0 {
+                    // Hero with lyrics panel on the right.
+                    ui.horizontal_top(|ui| {
+                        ui.allocate_ui_with_layout(Vec2::new(art_side, art_side), Layout::top_down(Align::Center), |ui| {
+                            let (art, _) = ui.allocate_exact_size(Vec2::splat(art_side), Sense::hover());
+                            glow_art(ui, th, &t.id, art);
+                        });
+                        ui.add_space(18.0);
+                        ui.allocate_ui_with_layout(Vec2::new(info_width, column_height), Layout::top_down(Align::Min), |ui| {
+                            info_column(ui, self, column_height);
                         });
                         ui.add_space(18.0);
                         ui.allocate_ui_with_layout(Vec2::new(lyrics_width, column_height), Layout::top_down(Align::Min), |ui| {
@@ -1432,7 +1489,7 @@ impl Rustym {
                         });
                     });
                 } else {
-                    // Compact layout: artwork and metadata share a bounded row; lyrics
+                    // Compact: artwork and metadata share a bounded row; lyrics
                     // become a full-width, height-limited panel beneath it.
                     ui.horizontal_top(|ui| {
                         ui.allocate_ui_with_layout(Vec2::new(art_side, art_side), Layout::top_down(Align::Center), |ui| {
@@ -1441,36 +1498,7 @@ impl Rustym {
                         });
                         ui.add_space(18.0);
                         ui.allocate_ui_with_layout(Vec2::new(info_width, art_side), Layout::top_down(Align::Min), |ui| {
-                            ui.add_space(8.0);
-                            ui.label(RichText::new("NOW PLAYING").size(10.0).strong().color(th.accent));
-                            ui.add_space(10.0);
-                            ui.label(RichText::new(&t.title).size(26.0).strong().color(th.text));
-                            ui.add_space(8.0);
-                            ui.label(RichText::new(&t.artist).size(15.0).color(th.dim2));
-                            if !t.album.is_empty() {
-                                ui.add_space(8.0);
-                                album_chip(ui, th, &t.album);
-                            }
-                            ui.add_space(18.0);
-                            ui.horizontal_wrapped(|ui| {
-                                let liked = self.liked_ids.contains(&t.id);
-                                if ui.add(accent_button(th, if liked { "♥  Liked" } else { "♡  Like" })).clicked() && t.local.is_empty() {
-                                    self.toggle_like(&t);
-                                }
-                                if ui.add(egui::Button::new(RichText::new(if lyrics_shown { "Hide lyrics" } else { "♫  Show lyrics" }).color(th.text)).rounding(10.0)).clicked() {
-                                    self.lyrics_enabled = !lyrics_shown;
-                                    self.cfg.auto_show_lyrics = self.lyrics_enabled;
-                                    self.cfg.save();
-                                }
-                            });
-                            ui.add_space(14.0);
-                            if self.snap.loading {
-                                ui.horizontal(|ui| { spin(ui, th); ui.label(RichText::new("Preparing your track…").size(12.0).color(th.dim)); });
-                            } else if self.snap.paused {
-                                ui.label(RichText::new("⏸  Paused").size(12.0).color(th.dim));
-                            } else {
-                                ui.label(RichText::new("Enjoying your music").size(12.0).color(th.dim));
-                            }
+                            info_column(ui, self, art_side);
                         });
                     });
                     if lyrics_shown {
@@ -1536,7 +1564,7 @@ impl Rustym {
                 });
         }
     }
-
+    
     fn draw_lyrics(&mut self, ui: &mut egui::Ui) {
         let th = self.theme;
         ui.horizontal(|ui| {

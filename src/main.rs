@@ -46,7 +46,7 @@ const fn rgb(r: u8, g: u8, b: u8) -> Color32 {
     Color32::from_rgb(r, g, b)
 }
 
-const THEMES: [Theme; 6] = [
+const THEMES: [Theme; 7] = [
     Theme { name: "Crimson", bg: rgb(11, 11, 14), panel: rgb(18, 18, 23), card: rgb(28, 28, 36), card2: rgb(44, 44, 58),
             accent: rgb(255, 61, 94), text: rgb(240, 240, 245), dim: rgb(140, 140, 155), dim2: rgb(175, 175, 190), light: false },
     Theme { name: "Ocean", bg: rgb(8, 12, 20), panel: rgb(13, 19, 31), card: rgb(22, 31, 48), card2: rgb(34, 48, 72),
@@ -59,7 +59,20 @@ const THEMES: [Theme; 6] = [
             accent: rgb(255, 140, 50), text: rgb(250, 242, 236), dim: rgb(166, 146, 136), dim2: rgb(204, 184, 172), light: false },
     Theme { name: "Snow", bg: rgb(245, 245, 248), panel: rgb(255, 255, 255), card: rgb(236, 236, 242), card2: rgb(220, 220, 230),
             accent: rgb(255, 45, 85), text: rgb(22, 22, 30), dim: rgb(110, 110, 125), dim2: rgb(75, 75, 90), light: true },
+    // Warm near-black with a cream accent - the signature Rustym look.
+    Theme { name: "Midnight", bg: rgb(22, 17, 14), panel: rgb(15, 12, 10), card: rgb(34, 27, 22), card2: rgb(51, 41, 32),
+            accent: rgb(242, 201, 162), text: rgb(247, 240, 231), dim: rgb(158, 143, 130), dim2: rgb(199, 183, 167), light: false },
 ];
+
+/// Serif display text (page titles, Now Playing hero). Falls back silently to
+/// the default font when no system serif is installed.
+fn serif_id(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name("rustym-serif".into()))
+}
+
+fn serif_italic_id(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name("rustym-serif-italic".into()))
+}
 
 fn apply_theme(ctx: &egui::Context, th: &Theme) {
     let mut v = if th.light { egui::Visuals::light() } else { egui::Visuals::dark() };
@@ -293,7 +306,7 @@ fn draw_glyph(p: &egui::Painter, g: Glyph, c: Pos2, col: Color32) {
 
 fn section(ui: &mut egui::Ui, th: Theme, title: &str, sub: &str) {
     ui.add_space(26.0);
-    ui.label(RichText::new(title).size(22.0).strong().color(th.text));
+    ui.label(RichText::new(title).font(serif_id(23.0)).color(th.text));
     if !sub.is_empty() {
         ui.label(RichText::new(sub).size(12.5).color(th.dim));
     }
@@ -533,9 +546,10 @@ fn icon_btn(ui: &mut egui::Ui, th: Theme, icon: Icon, size: f32, circle: bool) -
     let p = ui.painter();
     let fg;
     if circle {
-        let fill = if th.light { th.text } else if hot { Color32::WHITE } else { Color32::from_gray(232) };
+        // Accent-filled circle with a dark glyph - the signature play button.
+        let fill = if hot { th.accent.gamma_multiply(0.85) } else { th.accent };
         p.circle_filled(c, size / 2.0, fill);
-        fg = if th.light { Color32::WHITE } else { Color32::BLACK };
+        fg = if th.light { Color32::WHITE } else { rgb(20, 15, 11) };
     } else {
         fg = if hot { th.text } else { th.dim2 };
     }
@@ -721,6 +735,40 @@ fn setup_fonts(ctx: &egui::Context) {
                     f.push(name.clone());
                 }
             }
+        }
+    }
+    // Serif display family for titles (Noto Serif on most distros, DejaVu fallback).
+    // Missing glyphs fall through to the default proportional family.
+    let tail: Vec<String> = fonts
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    for (fam, candidates) in [
+        ("rustym-serif", ["NotoSerif-Regular", "NotoSerif-Medium", "DejaVuSerif", "LiberationSerif-Regular", "FreeSerif"].as_slice()),
+        ("rustym-serif-italic", ["NotoSerif-Italic", "DejaVuSerif-Italic", "LiberationSerif-Italic"].as_slice()),
+    ] {
+        let mut loaded: Vec<String> = Vec::new();
+        for stem in candidates {
+            for d in dirs.iter().chain(["/usr/share/fonts/dejavu", "/usr/share/fonts/truetype/dejavu", "/usr/share/fonts/truetype/liberation"].iter()) {
+                let p = Path::new(d).join(format!("{stem}.ttf"));
+                if p.is_file() {
+                    if let Ok(bytes) = std::fs::read(&p) {
+                        let name = format!("{stem}-display");
+                        fonts.font_data.insert(name.clone(), FontData::from_owned(bytes));
+                        loaded.push(name);
+                        break;
+                    }
+                }
+            }
+            if !loaded.is_empty() {
+                break;
+            }
+        }
+        if !loaded.is_empty() {
+            let mut list = loaded;
+            list.extend(tail.iter().cloned());
+            fonts.families.insert(FontFamily::Name(fam.into()), list);
         }
     }
     // Last-resort fallback bundled in the binary, so Bengali always renders even when
@@ -1757,10 +1805,11 @@ impl Rustym {
                             Pos2::new(r.center().x - 4.0, r.center().y + 6.0),
                             Pos2::new(r.center().x + 6.0, r.center().y),
                         ],
-                        Color32::WHITE,
+                        // Dark glyph on the accent dot, like the accent play button
+                        rgb(20, 15, 11),
                         Stroke::NONE,
                     ));
-                    ui.label(RichText::new("Rustym").size(22.0).strong().color(th.text));
+                    ui.label(RichText::new("R U S T Y M").size(17.5).strong().color(th.text));
                 });
                 ui.add_space(20.0);
 
@@ -1807,6 +1856,53 @@ impl Rustym {
                         ui.add_space(6.0);
                     }
                 });
+
+                // Your local playlists, right in the sidebar.
+                if !self.cfg.playlists.is_empty() {
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("YOUR PLAYLISTS").size(9.5).strong().color(th.dim));
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui.add(egui::Button::new(RichText::new("+").size(14.0).color(th.accent)).frame(false)).clicked() {
+                                self.back.clear();
+                                self.go(ctx, View::Playlists);
+                            }
+                        });
+                    });
+                    ui.add_space(4.0);
+                    let max_shown = 5.min(self.cfg.playlists.len());
+                    for i in 0..max_shown {
+                        let p = &self.cfg.playlists[i];
+                        let active = matches!(self.view, View::Playlist(v) if v == i);
+                        let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 34.0), Sense::click());
+                        let k = ui.ctx().animate_bool(resp.id, resp.hovered());
+                        if active {
+                            ui.painter().rect_filled(rect, 9.0, th.accent.gamma_multiply(0.15));
+                        } else if k > 0.01 {
+                            ui.painter().rect_filled(rect, 9.0, th.accent.gamma_multiply(0.07 * k));
+                        }
+                        let img = Rect::from_min_size(Pos2::new(rect.left() + 7.0, rect.center().y - 12.0), Vec2::splat(24.0));
+                        match p.tracks.first() {
+                            Some(t) => thumb(ui, &t.id, img, 6.0),
+                            None => {
+                                ui.painter().rect_filled(img, 6.0, th.card2);
+                            }
+                        }
+                        ui.painter().text(
+                            Pos2::new(img.right() + 10.0, rect.center().y),
+                            Align2::LEFT_CENTER,
+                            short_name(&p.name, 18),
+                            FontId::proportional(13.5),
+                            if active { th.text } else { th.dim2 },
+                        );
+                        if resp.clicked() {
+                            self.back.clear();
+                            self.go(ctx, View::Playlist(i));
+                        } else if resp.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                    }
+                }
 
                 ui.with_layout(Layout::bottom_up(Align::LEFT), |ui| {
                     if self.cfg.signed_in {
@@ -2021,7 +2117,7 @@ impl Rustym {
     fn header(&mut self, ui: &mut egui::Ui) {
         let th = self.theme;
         ui.horizontal(|ui| {
-            ui.label(RichText::new(&self.label).size(24.0).strong().color(th.text));
+            ui.label(RichText::new(&self.label).font(serif_id(25.0)).color(th.text));
             if self.loading {
                 ui.add_space(8.0);
                 spin(ui, th);
@@ -2905,6 +3001,8 @@ impl Rustym {
                     th.accent.gamma_multiply(0.16),
                     Color32::TRANSPARENT,
                 );
+                self.top_bar(ui, ctx);
+                ui.add_space(6.0);
                 match self.view {
                     View::Home => self.page_home(ui, ctx),
                     View::Mix(i) => self.page_mix(ui, i),
@@ -2922,6 +3020,58 @@ impl Rustym {
                     View::Detail => self.page_detail(ui, ctx),
                 }
             });
+    }
+
+    /// Floating top bar: back navigation and a rounded search pill that jumps
+    /// into the Search page (like the mock's top-right search field).
+    fn top_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let th = self.theme;
+        ui.horizontal(|ui| {
+            // Back button (uses the app's real navigation history).
+            let can_back = !self.back.is_empty();
+            let (r, resp) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::click());
+            let p = ui.painter();
+            if can_back {
+                p.circle_filled(r.center(), 16.0, th.card);
+                p.text(r.center(), Align2::CENTER_CENTER, "‹", FontId::proportional(19.0), th.text);
+                if resp.clicked() {
+                    if let Some(v) = self.back.pop() {
+                        self.go(ctx, v);
+                    }
+                } else if resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+            } else {
+                p.circle_filled(r.center(), 16.0, th.card.gamma_multiply(0.55));
+                p.text(r.center(), Align2::CENTER_CENTER, "‹", FontId::proportional(19.0), th.dim);
+            }
+
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let w = (ui.available_width() * 0.42).clamp(240.0, 420.0);
+                let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 34.0), Sense::click());
+                let p = ui.painter();
+                p.rect_filled(rect, 17.0, th.card);
+                p.text(
+                    Pos2::new(rect.left() + 16.0, rect.center().y),
+                    Align2::LEFT_CENTER,
+                    "⌕",
+                    FontId::proportional(15.0),
+                    th.dim2,
+                );
+                p.text(
+                    Pos2::new(rect.left() + 36.0, rect.center().y),
+                    Align2::LEFT_CENTER,
+                    "Search songs, artists, playlists…",
+                    FontId::proportional(13.0),
+                    th.dim,
+                );
+                if resp.clicked() {
+                    self.go(ctx, View::Search);
+                } else if resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+            });
+        });
     }
 
     fn add_modal(&mut self, ctx: &egui::Context) {

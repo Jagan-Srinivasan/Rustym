@@ -141,7 +141,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            theme: 3, // Violet
+            theme: 6, // Midnight
             browser: String::new(),
             account_name: String::new(),
             account_photo: String::new(),
