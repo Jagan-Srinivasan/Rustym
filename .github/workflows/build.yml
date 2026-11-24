@@ -13,9 +13,19 @@ jobs:
   # ---------- .deb (Debian/Ubuntu) and .rpm (Fedora) ----------
   deb-rpm:
     name: Build .deb + .rpm
-    runs-on: ubuntu-24.04
+    # IMPORTANT: build against the OLDEST supported glibc (glibc >= 2.35 =
+    # Ubuntu 22.04 / Debian 12 / Fedora 36 floor). Binaries built on newer
+    # runners refuse to run on older distros: `version `GLIBC_2.4x' not found`.
+    # Everything newer (Ubuntu 24.04, Debian 13, Fedora 40+) runs these fine.
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustc --version
 
       - name: Install build dependencies
         run: |

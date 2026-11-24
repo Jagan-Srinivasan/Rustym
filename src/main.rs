@@ -512,7 +512,13 @@ fn thumb(ui: &egui::Ui, id: &str, rect: Rect, radius: f32) {
     // tiny; maxres was 1280x720 (~3.7 MB decoded) per tile and stayed cached
     // forever.
     let side = rect.width().max(rect.height());
-    let variant = if side <= 300.0 { "mqdefault.jpg" } else { "maxresdefault.jpg" };
+    // Size-appropriate variant: mqdefault (320x180, always exists) for small
+    // tiles and rows, maxresdefault for anything bigger so square tiles stay
+    // sharp (mq's 180 px height would need upscaling above ~200 px). Together
+    // with the bounded cover-aware image loader this keeps decoded thumbnails
+    // tiny; maxres was 1280x720 (~3.7 MB decoded) per tile and stayed cached
+    // forever before.
+    let variant = if side <= 200.0 { "mqdefault.jpg" } else { "maxresdefault.jpg" };
     egui::Image::new(ImageSource::Uri(format!("https://i.ytimg.com/vi/{id}/{variant}").into()))
         .uv(Rect::from_min_max(Pos2::new(0.21875, 0.0), Pos2::new(0.78125, 1.0)))
         .fit_to_exact_size(rect.size())

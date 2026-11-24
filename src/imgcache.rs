@@ -31,12 +31,12 @@ const SWEEP: Duration = Duration::from_secs(3);
 /// Failed downloads are retried after this long.
 const RETRY: Duration = Duration::from_secs(30);
 /// Never decode wider/taller than this (Now Playing art is at most ~420 px).
-const MAX_SIDE: u32 = 768;
+const MAX_DECODE_SIDE: u32 = 1280;
 /// Minimum decode size, so tiny hints don't produce blurry upscales.
 const MIN_SIDE: u32 = 96;
 
 enum Entry {
-    Img { img: Arc<ColorImage>, served: u32, native: u32, last_used: Instant },
+    Img { img: Arc<ColorImage>, sw: u32, sh: u32, nw: u32, nh: u32, last_used: Instant },
     Err { at: Instant },
 }
 
@@ -120,26 +120,43 @@ fn entry_bytes(e: &Entry) -> usize {
     }
 }
 
-fn hint_side(hint: SizeHint) -> u32 {
+fn hint_box(hint: SizeHint) -> (u32, u32) {
     match hint {
-        SizeHint::Size(w, h) => w.max(h).clamp(MIN_SIDE, MAX_SIDE),
-        SizeHint::Width(w) | SizeHint::Height(w) => w.clamp(MIN_SIDE, MAX_SIDE),
-        _ => MAX_SIDE / 2, // Scale or unknown: a middle default (384)
+        SizeHint::Size(w, h) => (w, h),
+        SizeHint::Width(w) => (w, w),
+        SizeHint::Height(h) => (h, h),
+        _ => (MAX_DECODE_SIDE / 2, MAX_DECODE_SIDE / 2), // Scale or unknown: a middle default (384)
     }
 }
 
-fn decode(bytes: &[u8], target: u32) -> Option<(ColorImage, u32, u32)> {
+/// Cover-crop-aware decode: the UI always paints pictures with a "fill the
+/// box, crop the overflow" fit (egui's uv centre-crop / cover_uv), so decode
+/// such that BOTH decoded dimensions are >= the requested box. Decoding to
+/// `max side = box side` instead would shrink the cropped-away part too and
+/// made square tiles blurry (the cropped region then got upscaled ~1.8x).
+/// The result is sharp and still tiny: a 260 px tile costs ~0.5 MB decoded
+/// instead of ~3.7 MB.
+fn decode(bytes: &[u8], bw: u32, bh: u32) -> Option<(ColorImage, u32, u32, u32, u32)> {
     let im = image::load_from_memory(bytes).ok()?;
-    let (w, h) = (im.width(), im.height());
-    let big = w.max(h).max(1);
-    // Downscale to `target` on the long side (never upscale) to bound memory.
-    let scaled = if big > target { im.thumbnail(target, target) } else { im };
+    let (w, h) = (im.width().max(1), im.height().max(1));
+    // Cover the box (so the "fill box, crop overflow" paint is 1:1 and sharp),
+    // but never upscale beyond the native size - a source with fewer pixels
+    // than the box gains nothing from a bigger texture (the GPU stretches it
+    // at paint time), and the hit rule keeps such entries cached forever.
+    let mut scale = (bw.max(1) as f32 / w as f32).max(bh.max(1) as f32 / h as f32).min(1.0).max(1e-6);
+    let (w2, h2) = ((w as f32 * scale).ceil() as u32, (h as f32 * scale).ceil() as u32);
+    // Safety cap for gigantic sources
+    let (mut w2, mut h2) = (w2, h2);
+    if w2 > MAX_DECODE_SIDE || h2 > MAX_DECODE_SIDE {
+        let k = (MAX_DECODE_SIDE as f32) / (w2.max(h2) as f32);
+        w2 = (w2 as f32 * k) as u32;
+        h2 = (h2 as f32 * k) as u32;
+    }
+    let scaled = if scale < 1.0 { im.resize_exact(w2, h2, image::imageops::FilterType::Triangle) } else { im };
     let rgba = scaled.to_rgba8();
-    let (w2, h2) = (rgba.width(), rgba.height());
-    let ci = ColorImage::from_rgba_unmultiplied([w2 as usize, h2 as usize], rgba.as_raw());
-    // served = the max side we actually decoded to; native = the source's own max side.
-    // A hit is: served >= requested, or the source itself is no bigger than served.
-    Some((ci, big.min(target), big))
+    let (rw, rh) = (rgba.width(), rgba.height());
+    let ci = ColorImage::from_rgba_unmultiplied([rw as usize, rh as usize], rgba.as_raw());
+    Some((ci, rw, rh, w, h))
 }
 
 impl ImageLoader for BoundedImageLoader {
@@ -148,14 +165,16 @@ impl ImageLoader for BoundedImageLoader {
     }
 
     fn load(&self, ctx: &eframe::egui::Context, uri: &str, hint: SizeHint) -> ImageLoadResult {
-        let target = hint_side(hint);
+        let (mut bw, mut bh) = hint_box(hint);
+        bw = bw.clamp(MIN_SIDE, MAX_DECODE_SIDE);
+        bh = bh.clamp(MIN_SIDE, MAX_DECODE_SIDE);
         let now = Instant::now();
         {
             let mut cache = self.cache.lock();
             if let Some(e) = cache.get_mut(uri) {
                 match e {
-                    Entry::Img { img, served, native, last_used } => {
-                        if *served >= target || *native <= *served {
+                    Entry::Img { img, sw, sh, nw, nh, last_used } => {
+                        if (*sw >= bw && *sh >= bh) || (*nw <= *sw && *nh <= *sh) {
                             *last_used = now;
                             return Ok(ImagePoll::Ready { image: img.clone() });
                         }
@@ -173,15 +192,17 @@ impl ImageLoader for BoundedImageLoader {
 
         match ctx.try_load_bytes(uri) {
             Ok(eframe::egui::load::BytesPoll::Ready { bytes, .. }) => {
-                let Some((img, served, native)) = decode(&bytes, target) else {
+                let Some((img, sw, sh, nw, nh)) = decode(&bytes, bw, bh) else {
                     self.cache.lock().insert(uri.into(), Entry::Err { at: now });
                     return Err(LoadError::NotSupported);
                 };
                 let img = Arc::new(img);
                 self.cache.lock().insert(uri.into(), Entry::Img {
                     img: img.clone(),
-                    served,
-                    native,
+                    sw,
+                    sh,
+                    nw,
+                    nh,
                     last_used: now,
                 });
                 self.sweep(&mut self.cache.lock());
@@ -214,16 +235,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decode_downscales_to_target() {
+    fn decode_cover_crop_sharp() {
+        // 16:9 source painted into a square box: decode must keep height >= box
+        // so the centre-cropped square is not upscaled (the blur bug).
         let img = image::DynamicImage::new_rgb8(1280, 720);
         let mut buf = std::io::Cursor::new(Vec::new());
         img.write_to(&mut buf, image::ImageFormat::Jpeg).unwrap();
-        let (ci, served, native) = decode(buf.get_ref(), 96).unwrap();
-        assert_eq!(native, 1280);
-        assert_eq!(served, 96);
-        assert_eq!(ci.width().max(ci.height()), 96);
-        // A 45 px row now costs ~17 KB decoded instead of ~3.7 MB.
-        assert!(ci.pixels.len() * 4 < 100_000);
+        let (ci, sw, sh, nw, nh) = decode(buf.get_ref(), 260, 260).unwrap();
+        assert_eq!((nw, nh), (1280, 720));
+        assert!(sw >= 260 && sh >= 260, "decoded {sw}x{sh} must cover a 260x260 box");
+        assert_eq!(ci.width().max(ci.height()) as u32, sw);
+        // Still small: ~0.5 MB decoded instead of ~3.7 MB.
+        assert!(ci.pixels.len() * 4 < 800_000);
     }
 
     #[test]
@@ -231,8 +254,18 @@ mod tests {
         let img = image::DynamicImage::new_rgb8(320, 180);
         let mut buf = std::io::Cursor::new(Vec::new());
         img.write_to(&mut buf, image::ImageFormat::Jpeg).unwrap();
-        let (_, served, native) = decode(buf.get_ref(), 420).unwrap();
-        assert_eq!(native, 320);
-        assert_eq!(served, 320); // hit rule native <= served keeps this cached
+        let (_, sw, sh, nw, nh) = decode(buf.get_ref(), 420, 420).unwrap();
+        assert_eq!((nw, nh), (320, 180));
+        assert_eq!((sw, sh), (320, 180)); // native <= served keeps this cached
+    }
+
+    #[test]
+    fn tiny_box_gets_min_decode() {
+        let img = image::DynamicImage::new_rgb8(1280, 720);
+        let mut buf = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut buf, image::ImageFormat::Jpeg).unwrap();
+        let (ci, _, _, _, _) = decode(buf.get_ref(), 45, 45).unwrap();
+        assert!(ci.width().max(ci.height()) <= 1280);
+        assert!(ci.pixels.len() * 4 < 1_000_000);
     }
 }

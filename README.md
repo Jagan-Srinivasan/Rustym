@@ -48,6 +48,32 @@ launcher into `~/.local`. It works on GNOME, KDE Plasma, XFCE, Cinnamon, MATE, L
 others, on X11 and Wayland. Then click **Sign in with Google** inside the app.
 Options: `--no-deps`, `--no-login`, `--system`. Details: [docs/INSTALL.md](docs/INSTALL.md).
 
+Options: `--no-deps`, `--no-login`, `--system`. Details: [docs/INSTALL.md](docs/INSTALL.md).
+
+## Ready-made packages (built by GitHub Actions)
+
+The CI builds every package against the **oldest supported glibc (2.35)**, so one package per
+family runs on both old and new distros (a binary built on a newer distro would refuse to start
+on older ones with `version 'GLIBC_2.4x' not found`):
+
+| Package | Distro family | Works on |
+|---------|---------------|----------|
+| `rustym_*_amd64.deb` | Debian / Ubuntu / Mint / Pop!\_OS | Ubuntu 22.04+, Debian 12+, and any newer derivative |
+| `rustym-*.x86_64.rpm` | Fedora / RHEL-family | Fedora 36+ (uses `mpv`, `yt-dlp`, `ffmpeg-free`, `gtk3`, `webkit2gtk4.1`) |
+| `rustym-*.pkg.tar.zst` | Arch / Manjaro / CachyOS / EndeavourOS | any current Arch (`pacman -U rustym-*.pkg.tar.zst`) |
+
+Runtime dependency names baked into the packages (checked per distro):
+
+| Dependency | .deb (Debian/Ubuntu) | .rpm (Fedora) | PKGBUILD (Arch) |
+|------------|----------------------|----------------|------------------|
+| playback | `mpv` | `mpv` | `mpv` |
+| streams | `yt-dlp` | `yt-dlp` | `yt-dlp` |
+| codecs/EQ | `ffmpeg` | `ffmpeg-free` | `ffmpeg` |
+| sign-in helper | `libgtk-3-0`, `libwebkit2gtk-4.1-0` | `gtk3`, `webkit2gtk4.1` | `gtk3`, `webkit2gtk-4.1` |
+| desktop integration | `xdg-utils` | `xdg-utils` | `xdg-utils` |
+| visualiser | `pulseaudio-utils` (recommended to install) | `pulseaudio-utils` | `libpulse` |
+| JS for yt-dlp | `deno` (Recommends) | — | `deno` (optdepends) |
+
 ## Dependencies at a glance
 
 | Need | Arch | Debian / Ubuntu | Fedora | Why |
