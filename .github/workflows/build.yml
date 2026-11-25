@@ -88,6 +88,15 @@ jobs:
             mkdir -p src/rustym-$VER
             tar --exclude=./target --exclude=./dist --exclude=./.git \
                 --exclude=./src/rustym-$VER -cf - . | tar -xf - -C src/rustym-$VER
+          else
+            # Tag build: point PKGBUILD at the tarball of the pushed tag itself.
+            # The tag name need not match Cargo.toml's version (e.g. v0.0.2 while
+            # the crate is 0.4.0), and GitHub tag tarballs extract as
+            # <repo>-<tag-without-v>, so align pkgver with the tag for _srcdir().
+            TAGVER="${GITHUB_REF_NAME#v}"
+            sed -i "s/^pkgver=.*/pkgver=$TAGVER/" PKGBUILD
+            sed -i "s|^source=.*|source=(\"$pkgname-$TAGVER.tar.gz::$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/archive/refs/tags/$GITHUB_REF_NAME.tar.gz\")|" PKGBUILD
+            sed -i "s|^sha256sums=.*|sha256sums=('SKIP')|" PKGBUILD
           fi
 
           useradd -m builder
