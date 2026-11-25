@@ -12,7 +12,7 @@ mod ytm;
 
 use eframe::egui::{
     self, Align, Align2, Color32, FontData, FontDefinitions, FontFamily, FontId, ImageSource, Layout, Margin,
-    Pos2, Rect, RichText, Sense, Shape, Stroke, Vec2,
+    Pos2, Rect, RichText, Sense, Shape, Stroke, UiBuilder, Vec2,
 };
 use engine::*;
 use eframe::egui::load::{BytesLoader, ImageLoader};
@@ -184,6 +184,9 @@ enum Icon {
     Pause,
     Next,
     Prev,
+    Shuffle,
+    Repeat,
+    Heart,
 }
 
 
@@ -542,7 +545,7 @@ fn thumb(ui: &egui::Ui, id: &str, rect: Rect, radius: f32) {
         .paint_at(ui, rect);
 }
 
-fn icon_btn(ui: &mut egui::Ui, th: Theme, icon: Icon, size: f32, circle: bool) -> egui::Response {
+fn icon_btn(ui: &mut egui::Ui, th: Theme, icon: Icon, size: f32, circle: bool, active: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
     let hot = resp.hovered();
     let c = rect.center();
@@ -554,7 +557,11 @@ fn icon_btn(ui: &mut egui::Ui, th: Theme, icon: Icon, size: f32, circle: bool) -
         p.circle_filled(c, size / 2.0, fill);
         fg = if th.light { Color32::WHITE } else { rgb(20, 15, 11) };
     } else {
-        fg = if hot { th.text } else { th.dim2 };
+        if hot {
+            // Soft hover disc behind the glyph.
+            p.circle_filled(c, size * 0.5, th.card2);
+        }
+        fg = if active { th.accent } else if hot { th.text } else { th.dim2 };
     }
     let s = size * if circle { 0.26 } else { 0.22 };
     match icon {
@@ -609,6 +616,62 @@ fn icon_btn(ui: &mut egui::Ui, th: Theme, icon: Icon, size: f32, circle: bool) -
                 1.0,
                 fg,
             );
+        }
+        Icon::Shuffle => {
+            // Two crossing arrows with solid wedge arrowheads in the top-right
+            // and bottom-right corners.
+            let w = s * 1.6;  // half width
+            let h = s * 1.0;  // half height
+            let a = s * 0.72; // corner arrowhead size
+            let (l, r, t, b) = (c.x - w, c.x + w, c.y - h, c.y + h);
+            p.line_segment([Pos2::new(l, b), Pos2::new(r, t)], Stroke::new(1.5_f32, fg));
+            p.line_segment([Pos2::new(l, t), Pos2::new(r, b)], Stroke::new(1.5_f32, fg));
+            // top-right wedge (arrow pointing up-right into the corner)
+            p.add(Shape::convex_polygon(
+                vec![Pos2::new(r - a, t), Pos2::new(r, t), Pos2::new(r, t + a)],
+                fg,
+                Stroke::NONE,
+            ));
+            // bottom-right wedge (arrow pointing down-right into the corner)
+            p.add(Shape::convex_polygon(
+                vec![Pos2::new(r - a, b), Pos2::new(r, b), Pos2::new(r, b - a)],
+                fg,
+                Stroke::NONE,
+            ));
+        }
+        Icon::Repeat => {
+            // Loop of two opposing arrows: top edge points right, bottom edge
+            // points left, joined by stubs on opposite sides.
+            let w = s * 1.6;   // half width
+            let h = s * 0.95;  // half height
+            let a = s * 0.62;  // arrowhead length
+            let aw = s * 0.48; // arrowhead half-width
+            let (l, r, t, b) = (c.x - w, c.x + w, c.y - h, c.y + h);
+            let st = Stroke::new(1.5_f32, fg);
+            p.line_segment([Pos2::new(l, t), Pos2::new(r - a, t)], st);
+            p.line_segment([Pos2::new(r, b), Pos2::new(l + a, b)], st);
+            p.line_segment([Pos2::new(l, t), Pos2::new(l, c.y)], st);
+            p.line_segment([Pos2::new(r, b), Pos2::new(r, c.y)], st);
+            p.add(Shape::convex_polygon(
+                vec![Pos2::new(r - a, t - aw), Pos2::new(r - a, t + aw), Pos2::new(r, t)],
+                fg,
+                Stroke::NONE,
+            ));
+            p.add(Shape::convex_polygon(
+                vec![Pos2::new(l + a, b - aw), Pos2::new(l + a, b + aw), Pos2::new(l, b)],
+                fg,
+                Stroke::NONE,
+            ));
+        }
+        Icon::Heart => {
+            let r = s * 1.1;
+            p.circle_filled(Pos2::new(c.x - r * 0.5, c.y - r * 0.35), r * 0.62, fg);
+            p.circle_filled(Pos2::new(c.x + r * 0.5, c.y - r * 0.35), r * 0.62, fg);
+            p.add(Shape::convex_polygon(
+                vec![Pos2::new(c.x - r * 1.05, c.y - r * 0.15), Pos2::new(c.x + r * 1.05, c.y - r * 0.15), Pos2::new(c.x, c.y + r * 1.15)],
+                fg,
+                Stroke::NONE,
+            ));
         }
     }
     if hot {
@@ -1984,166 +2047,265 @@ impl Rustym {
     fn player(&mut self, ctx: &egui::Context) {
         let th = self.theme;
         egui::TopBottomPanel::bottom("player")
-            .exact_height(92.0)
-            .frame(egui::Frame::none().fill(th.panel).inner_margin(Margin::symmetric(20.0, 10.0)))
+            .exact_height(96.0)
+            .frame(egui::Frame::none().fill(th.panel).inner_margin(Margin::symmetric(24.0, 12.0)))
             .show(ctx, |ui| {
-                let top = ui.max_rect().top() - 10.0;
+                let top = ui.max_rect().top() - 12.0;
                 ui.painter().line_segment(
-                    [Pos2::new(ui.max_rect().left() - 20.0, top), Pos2::new(ui.max_rect().right() + 20.0, top)],
+                    [Pos2::new(ui.max_rect().left() - 24.0, top), Pos2::new(ui.max_rect().right() + 24.0, top)],
                     Stroke::new(1.0_f32, th.card2),
                 );
-                ui.columns(3, |cols| {
-                    let cur = self.snap.current.clone();
-                    cols[0].horizontal(|ui| match &cur {
-                        Some(t) => {
-                            let (r, rr) = ui.allocate_exact_size(Vec2::new(54.0, 54.0), Sense::click());
-                            thumb(ui, &t.id, r, 8.0);
+                let full = ui.max_rect();
+                let cur = self.snap.current.clone();
+                // Centre the controls on the whole app window (sidebar included),
+                // not just this panel. The widest centred row (the seek bar) decides
+                // how much room the sides get; they shrink on narrow windows.
+                let win_cx = ui.ctx().screen_rect().center().x;
+                const HALF_ROW: f32 = 200.0; // half of the widest centred row
+                let left_w = (win_cx - HALF_ROW - 12.0 - full.left()).clamp(0.0, 300.0);
+                let right_w = (full.right() - win_cx - HALF_ROW - 12.0).clamp(0.0, 360.0);
+                let cw = ((win_cx - full.left() - left_w - 12.0) * 2.0)
+                    .min((full.right() - right_w - 12.0 - win_cx) * 2.0)
+                    .clamp(230.0, 480.0);
+                let left_rect = Rect::from_min_max(full.left_top(), Pos2::new(full.left() + left_w, full.bottom()));
+                let right_rect = Rect::from_min_max(Pos2::new(full.right() - right_w, full.top()), full.right_bottom());
+                let center_rect = Rect::from_min_size(Pos2::new(win_cx - cw / 2.0, full.top()), Vec2::new(cw, full.height()));
+
+                // ---- left: artwork, track info and a like heart ----
+                ui.allocate_new_ui(UiBuilder::new().max_rect(left_rect), |ui| {
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        if left_w < 150.0 {
+                            // No room beside the transport on narrow windows.
+                        } else if let Some(t) = &cur {
+                            let (r, rr) = ui.allocate_exact_size(Vec2::new(56.0, 56.0), Sense::click());
+                            thumb(ui, &t.id, r, 10.0);
                             if rr.clicked() {
                                 self.view = View::Now;
                             }
+                            ui.add_space(10.0);
                             ui.vertical(|ui| {
-                                ui.add_space(8.0);
                                 // Clicking the track info opens the Now Playing page
-                                if ui.add(egui::Label::new(RichText::new(&t.title).size(15.0).strong().color(th.text)).wrap_mode(egui::TextWrapMode::Truncate).sense(Sense::click())).clicked() {
+                                if ui.add(egui::Label::new(RichText::new(&t.title).size(14.5).strong().color(th.text)).wrap_mode(egui::TextWrapMode::Truncate).sense(Sense::click())).clicked() {
                                     self.view = View::Now;
                                     self.label = "Now playing".into();
                                     self.status.clear();
                                     self.back.clear();
                                 }
-                                if ui.add(egui::Label::new(RichText::new(&t.artist).size(13.0).color(th.dim)).wrap_mode(egui::TextWrapMode::Truncate).sense(Sense::click())).clicked() {
+                                if ui.add(egui::Label::new(RichText::new(&t.artist).size(12.5).color(th.dim)).wrap_mode(egui::TextWrapMode::Truncate).sense(Sense::click())).clicked() {
                                     self.view = View::Now;
                                     self.label = "Now playing".into();
                                     self.status.clear();
                                     self.back.clear();
                                 }
                             });
-                        }
-                        None => {
-                            ui.add_space(8.0);
-                            ui.label(RichText::new("Nothing playing").color(th.dim));
-                        }
-                    });
-
-                    let ui = &mut cols[1];
-                    let row_w = ui.available_width();
-                    ui.allocate_ui_with_layout(Vec2::new(row_w, 40.0), Layout::left_to_right(Align::Center), |ui| {
-                        ui.add_space(((ui.available_width() - 450.0) / 2.0).max(0.0));
-                        ui.spacing_mut().item_spacing.x = 14.0;
-                        if self.pill(ui, "Shuffle", self.snap.shuffle).clicked() {
-                            let on = !self.snap.shuffle;
-                            self.cfg.shuffle = on;
-                            self.cfg.save();
-                            let _ = self.cmd.send(Cmd::Shuffle(on));
-                        }
-                        if icon_btn(ui, th, Icon::Prev, 30.0, false).clicked() {
-                            let _ = self.cmd.send(Cmd::Prev);
-                        }
-                        let ic = if self.snap.paused || !self.snap.playing { Icon::Play } else { Icon::Pause };
-                        if icon_btn(ui, th, ic, 40.0, true).clicked() {
-                            let _ = self.cmd.send(Cmd::Toggle);
-                        }
-                        if icon_btn(ui, th, Icon::Next, 30.0, false).clicked() {
-                            let _ = self.cmd.send(Cmd::Next);
-                        }
-                        let rl = match self.snap.repeat {
-                            Repeat::Off => "Repeat",
-                            Repeat::All => "Repeat all",
-                            Repeat::One => "Repeat one",
-                        };
-                        if self.pill(ui, rl, self.snap.repeat != Repeat::Off).clicked() {
-                            let r = match self.snap.repeat {
-                                Repeat::Off => Repeat::All,
-                                Repeat::All => Repeat::One,
-                                Repeat::One => Repeat::Off,
-                            };
-                            self.cfg.repeat = r;
-                            self.cfg.save();
-                            let _ = self.cmd.send(Cmd::SetRepeat(r));
-                        }
-                        // sound modes, kept apart from the transport buttons
-                        ui.add_space(22.0);
-                        let bass_on = self.cfg.fx.eq_on && self.cfg.fx.eq == BASS_EQ;
-                        let mut fx = self.cfg.fx.clone();
-                        if self.pill(ui, "8D", self.cfg.fx.eight_d).clicked() {
-                            fx.eight_d = !fx.eight_d;
-                        }
-                        if self.pill(ui, "Bass", bass_on).clicked() {
-                            if bass_on {
-                                fx.eq_on = false;
-                                fx.eq = [0.0; 10];
-                            } else {
-                                fx.eq_on = true;
-                                fx.eq = BASS_EQ;
-                            }
-                        }
-                        if fx != self.cfg.fx {
-                            self.cfg.fx = fx.clone();
-                            let _ = self.cmd.send(Cmd::SetFx(fx));
-                            self.cfg.save();
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        let dur = self.snap.dur;
-                        let frac = self.drag.unwrap_or(if dur > 0.0 { (self.snap.pos / dur) as f32 } else { 0.0 });
-                        ui.label(RichText::new(fmt_time(frac as f64 * dur)).size(12.0).color(th.dim));
-                        let w = ui.available_width() - 48.0;
-                        let resp = bar(ui, th, frac, w);
-                        if resp.dragged() || resp.clicked() {
-                            if let Some(p) = resp.interact_pointer_pos() {
-                                self.drag = Some(((p.x - resp.rect.left()) / resp.rect.width()).clamp(0.0, 1.0));
-                            }
-                        }
-                        if resp.drag_stopped() || resp.clicked() {
-                            if let Some(f) = self.drag.take() {
-                                if dur > 0.0 {
-                                    let _ = self.cmd.send(Cmd::Seek(f as f64 * dur));
+                            // like / unlike
+                            if t.local.is_empty() {
+                                ui.add_space(8.0);
+                                let liked = self.liked_ids.contains(&t.id);
+                                if icon_btn(ui, th, Icon::Heart, 22.0, false, liked).clicked() {
+                                    self.toggle_like(t);
                                 }
                             }
+                        } else {
+                            ui.label(RichText::new("Nothing playing").size(13.0).color(th.dim));
                         }
-                        ui.label(RichText::new(fmt_time(dur)).size(12.0).color(th.dim));
                     });
+                });
 
-                    cols[2].with_layout(Layout::top_down(Align::Max), |ui| {
-                        ui.add_space(8.0);
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let resp = bar(ui, th, self.cfg.volume / 100.0, 110.0);
+                // ---- centre: transport controls above the seek bar, centred on
+                // the app window. egui lays row widgets out sequentially, so each
+                // row gets an exact-size child that the parent centres for us.
+                ui.allocate_new_ui(UiBuilder::new().max_rect(center_rect), |ui| {
+                    ui.with_layout(Layout::top_down(Align::Center).with_main_align(Align::Min), |ui| {
+                        ui.add_space(2.0);
+                        ui.allocate_ui_with_layout(Vec2::new(230.0, 42.0), Layout::left_to_right(Align::Center), |ui| {
+                            ui.spacing_mut().item_spacing.x = 18.0;
+                            if icon_btn(ui, th, Icon::Shuffle, 28.0, false, self.snap.shuffle).clicked() {
+                                let on = !self.snap.shuffle;
+                                self.cfg.shuffle = on;
+                                self.cfg.save();
+                                let _ = self.cmd.send(Cmd::Shuffle(on));
+                            }
+                            if icon_btn(ui, th, Icon::Prev, 30.0, false, false).clicked() {
+                                let _ = self.cmd.send(Cmd::Prev);
+                            }
+                            let ic = if self.snap.paused || !self.snap.playing { Icon::Play } else { Icon::Pause };
+                            if icon_btn(ui, th, ic, 42.0, true, false).clicked() {
+                                let _ = self.cmd.send(Cmd::Toggle);
+                            }
+                            if icon_btn(ui, th, Icon::Next, 30.0, false, false).clicked() {
+                                let _ = self.cmd.send(Cmd::Next);
+                            }
+                            let rr = icon_btn(ui, th, Icon::Repeat, 28.0, false, self.snap.repeat != Repeat::Off);
+                            if rr.clicked() {
+                                let r = match self.snap.repeat {
+                                    Repeat::Off => Repeat::All,
+                                    Repeat::All => Repeat::One,
+                                    Repeat::One => Repeat::Off,
+                                };
+                                self.cfg.repeat = r;
+                                self.cfg.save();
+                                let _ = self.cmd.send(Cmd::SetRepeat(r));
+                            }
+                            // "repeat one" badge in the middle of the loop
+                            if matches!(self.snap.repeat, Repeat::One) {
+                                let bc = rr.rect.center();
+                                let p1 = ui.painter();
+                                p1.circle_filled(bc, 6.0, th.panel);
+                                p1.text(bc, Align2::CENTER_CENTER, "1", FontId::monospace(9.0), th.accent);
+                            }
+                        });
+                        ui.add_space(6.0);
+                        let dur = self.snap.dur;
+                        let frac = self.drag.unwrap_or(if dur > 0.0 { (self.snap.pos / dur) as f32 } else { 0.0 });
+                        let t1 = fmt_time(frac as f64 * dur);
+                        let t2 = fmt_time(dur);
+                        let mono = FontId::monospace(11.5);
+                        let (w1, w2) = ui.ctx().fonts(|f| {
+                            (
+                                f.layout_no_wrap(t1.clone(), mono.clone(), Color32::WHITE).rect.width(),
+                                f.layout_no_wrap(t2.clone(), mono.clone(), Color32::WHITE).rect.width(),
+                            )
+                        });
+                        let bar_w = (cw * 0.66).max(120.0);
+                        let row_w = w1 + w2 + bar_w + 20.0;
+                        ui.allocate_ui_with_layout(Vec2::new(row_w, 18.0), Layout::left_to_right(Align::Center), |ui| {
+                            ui.spacing_mut().item_spacing.x = 10.0;
+                            ui.label(RichText::new(&t1).size(11.5).color(th.dim).font(mono.clone()));
+                            let resp = bar(ui, th, frac, bar_w);
                             if resp.dragged() || resp.clicked() {
                                 if let Some(p) = resp.interact_pointer_pos() {
-                                    let f = ((p.x - resp.rect.left()) / resp.rect.width()).clamp(0.0, 1.0);
-                                    self.cfg.volume = f * 100.0;
-                                    let _ = self.cmd.send(Cmd::Volume(self.cfg.volume));
+                                    self.drag = Some(((p.x - resp.rect.left()) / resp.rect.width()).clamp(0.0, 1.0));
                                 }
                             }
                             if resp.drag_stopped() || resp.clicked() {
-                                self.cfg.save();
-                            }
-                            ui.label(RichText::new("Vol").size(12.0).color(th.dim));
-                            ui.add_space(8.0);
-                            if self.pill(ui, "Sound", self.fx_open || self.snap.sleep_left.is_some() || self.snap.sleep_eot).clicked() {
-                                self.fx_open = !self.fx_open;
-                            }
-                            if self.pill(ui, "Queue", self.show_queue).clicked() {
-                                self.show_queue = !self.show_queue;
-                            }
-                            let cur_id = self.snap.current.as_ref().map(|c| c.id.clone()).unwrap_or_default();
-                            let lyrics_shown = !cur_id.is_empty() && self.lyrics_enabled;
-                            if self.pill(ui, "Lyrics", lyrics_shown).clicked() {
-                                self.lyrics_enabled = !self.lyrics_enabled;
-                                self.cfg.auto_show_lyrics = self.lyrics_enabled;
-                                self.cfg.save();
-                                if self.lyrics_enabled && self.view != View::Now {
-                                    self.go(ui.ctx(), View::Now);
-                                }
-                            }
-                            if let Some(t) = self.snap.current.clone() {
-                                if t.local.is_empty() {
-                                    let liked = self.liked_ids.contains(&t.id);
-                                    if self.pill(ui, if liked { "Liked" } else { "Like" }, liked).clicked() {
-                                        self.toggle_like(&t);
+                                if let Some(f) = self.drag.take() {
+                                    if dur > 0.0 {
+                                        let _ = self.cmd.send(Cmd::Seek(f as f64 * dur));
                                     }
                                 }
                             }
+                            ui.label(RichText::new(&t2).size(11.5).color(th.dim).font(mono));
                         });
+                    });
+                });
+
+                // ---- right: mode toggles above the volume slider ----
+                ui.allocate_new_ui(UiBuilder::new().max_rect(right_rect), |ui| {
+                    ui.with_layout(Layout::top_down(Align::Max).with_main_align(Align::Min), |ui| {
+                        let cur_id = cur.as_ref().map(|c| c.id.clone()).unwrap_or_default();
+                        let lyrics_shown = !cur_id.is_empty() && self.lyrics_enabled;
+                        let bass_on = self.cfg.fx.eq_on && self.cfg.fx.eq == BASS_EQ;
+                        let mut fx = self.cfg.fx.clone();
+                        let narrow = right_w < 340.0;
+                        let tight = right_w < 240.0; // no room for the volume slider
+                        if narrow {
+                            // Two compact rows so nothing overlaps the transport.
+                            ui.add_space(4.0);
+                            ui.allocate_ui_with_layout(Vec2::new(right_w, 26.0), Layout::right_to_left(Align::Center), |ui| {
+                                if self.pill(ui, "Sound", self.fx_open || self.snap.sleep_left.is_some() || self.snap.sleep_eot).clicked() {
+                                    self.fx_open = !self.fx_open;
+                                }
+                                if self.pill(ui, "Queue", self.show_queue).clicked() {
+                                    self.show_queue = !self.show_queue;
+                                }
+                                if self.pill(ui, "Lyrics", lyrics_shown).clicked() {
+                                    self.lyrics_enabled = !self.lyrics_enabled;
+                                    self.cfg.auto_show_lyrics = self.lyrics_enabled;
+                                    self.cfg.save();
+                                    if self.lyrics_enabled && self.view != View::Now {
+                                        self.go(ui.ctx(), View::Now);
+                                    }
+                                }
+                            });
+                            ui.add_space(6.0);
+                            ui.allocate_ui_with_layout(Vec2::new(right_w, 26.0), Layout::right_to_left(Align::Center), |ui| {
+                                if !tight {
+                                    let resp = bar(ui, th, self.cfg.volume / 100.0, (right_w * 0.38).max(70.0));
+                                    if resp.dragged() || resp.clicked() {
+                                        if let Some(p) = resp.interact_pointer_pos() {
+                                            let f = ((p.x - resp.rect.left()) / resp.rect.width()).clamp(0.0, 1.0);
+                                            self.cfg.volume = f * 100.0;
+                                            let _ = self.cmd.send(Cmd::Volume(self.cfg.volume));
+                                        }
+                                    }
+                                    if resp.drag_stopped() || resp.clicked() {
+                                        self.cfg.save();
+                                    }
+                                    ui.add_space(8.0);
+                                    ui.label(RichText::new("Vol").size(11.5).color(th.dim));
+                                    ui.add_space(8.0);
+                                }
+                                if self.pill(ui, "8D", self.cfg.fx.eight_d).clicked() {
+                                    fx.eight_d = !fx.eight_d;
+                                }
+                                if self.pill(ui, "Bass", bass_on).clicked() {
+                                    if bass_on {
+                                        fx.eq_on = false;
+                                        fx.eq = [0.0; 10];
+                                    } else {
+                                        fx.eq_on = true;
+                                        fx.eq = BASS_EQ;
+                                    }
+                                }
+                                if fx != self.cfg.fx {
+                                    self.cfg.fx = fx.clone();
+                                    let _ = self.cmd.send(Cmd::SetFx(fx));
+                                    self.cfg.save();
+                                }
+                            });
+                        } else {
+                            ui.add_space(6.0);
+                            ui.allocate_ui_with_layout(Vec2::new(right_w, 26.0), Layout::right_to_left(Align::Center), |ui| {
+                                if self.pill(ui, "Sound", self.fx_open || self.snap.sleep_left.is_some() || self.snap.sleep_eot).clicked() {
+                                    self.fx_open = !self.fx_open;
+                                }
+                                if self.pill(ui, "Queue", self.show_queue).clicked() {
+                                    self.show_queue = !self.show_queue;
+                                }
+                                if self.pill(ui, "Lyrics", lyrics_shown).clicked() {
+                                    self.lyrics_enabled = !self.lyrics_enabled;
+                                    self.cfg.auto_show_lyrics = self.lyrics_enabled;
+                                    self.cfg.save();
+                                    if self.lyrics_enabled && self.view != View::Now {
+                                        self.go(ui.ctx(), View::Now);
+                                    }
+                                }
+                                if self.pill(ui, "Bass", bass_on).clicked() {
+                                    if bass_on {
+                                        fx.eq_on = false;
+                                        fx.eq = [0.0; 10];
+                                    } else {
+                                        fx.eq_on = true;
+                                        fx.eq = BASS_EQ;
+                                    }
+                                }
+                                if self.pill(ui, "8D", self.cfg.fx.eight_d).clicked() {
+                                    fx.eight_d = !fx.eight_d;
+                                }
+                                if fx != self.cfg.fx {
+                                    self.cfg.fx = fx.clone();
+                                    let _ = self.cmd.send(Cmd::SetFx(fx));
+                                    self.cfg.save();
+                                }
+                            });
+                            ui.add_space(8.0);
+                            ui.allocate_ui_with_layout(Vec2::new(right_w, 18.0), Layout::right_to_left(Align::Center), |ui| {
+                                let resp = bar(ui, th, self.cfg.volume / 100.0, 120.0);
+                                if resp.dragged() || resp.clicked() {
+                                    if let Some(p) = resp.interact_pointer_pos() {
+                                        let f = ((p.x - resp.rect.left()) / resp.rect.width()).clamp(0.0, 1.0);
+                                        self.cfg.volume = f * 100.0;
+                                        let _ = self.cmd.send(Cmd::Volume(self.cfg.volume));
+                                    }
+                                }
+                                if resp.drag_stopped() || resp.clicked() {
+                                    self.cfg.save();
+                                }
+                                ui.add_space(10.0);
+                                ui.label(RichText::new("Vol").size(11.5).color(th.dim));
+                            });
+                        }
                     });
                 });
             });
