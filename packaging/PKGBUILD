@@ -5,6 +5,8 @@ pkgver=0.0.3
 pkgrel=1
 pkgdesc="Ad-free, feature-rich YouTube Music player for Linux (pure Rust + egui)"
 arch=('x86_64')
+# No split -debug package (it would end up on the release page next to the real one).
+options=('!debug')
 url="https://github.com/Jagan-Srinivasan/Rustym"
 license=('GPL-3.0-only')
 depends=('mpv' 'ffmpeg' 'gtk3' 'webkit2gtk-4.1' 'libxkbcommon' 'libx11' 'libxcursor'
