@@ -104,9 +104,13 @@ jobs:
             # Not a tag: build from this checkout. Pack the checkout into a
             # source tarball with the same top-level layout makepkg expects
             # (rustym-$VER/), and let makepkg fetch yt-dlp + deno itself.
+            # The tarball is written outside the tree and moved in afterwards:
+            # tar reads '.', so a growing file inside it aborts with
+            # "file changed as we read it".
             tar --exclude=./target --exclude=./dist --exclude=./.git \
                 --exclude=./packaging/bundled --exclude=./rustym-$VER.tar.gz \
-                --transform "s,^\./,rustym-$VER/," -czf rustym-$VER.tar.gz .
+                --transform "s,^\./,rustym-$VER/," -czf /tmp/rustym-$VER.tar.gz .
+            mv /tmp/rustym-$VER.tar.gz .
             APP_SRC="rustym-$VER.tar.gz"
           else
             # Tag build: point PKGBUILD at the tarball of the pushed tag itself.
