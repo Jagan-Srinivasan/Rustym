@@ -371,6 +371,175 @@ fn install_deno() -> String {
     crate::distro::install_hint(&[crate::distro::Pkg::Deno])
 }
 
+// ---------------- managed yt-dlp + deno (bundle + in-app updater) ----------------
+//
+// Packages carry current copies of yt-dlp and deno in /usr/lib/rustym/ (see
+// .github/workflows/build.yml); extend_path() in main.rs puts them, and the
+// user-updated copies in ~/.local/bin, at the FRONT of PATH so every child
+// process - mpv's ytdl_hook included - uses them instead of the distro's
+// often years-old yt-dlp.
+
+const YTDLP_LINUX_URL: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux";
+const DENO_LINUX_URL: &str = "https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip";
+
+/// "mpv v0.42.0 Copyright (c) ..." -> "mpv v0.42.0"; "deno 2.9.8 (stable, ...)" -> "deno 2.9.8".
+fn first_version(t: &str) -> String {
+    let mut v = t.lines().next().unwrap_or("").to_string();
+    if let Some(i) = v.find("Copyright") {
+        v.truncate(i);
+    }
+    if let Some(i) = v.find('(') {
+        v.truncate(i);
+    }
+    v.trim().to_string()
+}
+
+/// One row of the Settings > Dependencies card: (name, version line, path, missing).
+pub type DepRow = (&'static str, String, String, bool);
+
+/// Versions of the runtime dependencies, for the Settings page. Runs four
+/// short processes; cheap enough to call when the Settings view is entered.
+pub fn dep_report() -> Vec<DepRow> {
+    let mut out = Vec::new();
+    for (name, arg) in [
+        ("yt-dlp", "--version"),
+        ("deno", "--version"),
+        ("mpv", "--version"),
+        ("ffmpeg", "-version"),
+    ] {
+        let path = run_cmd("sh", &["-c", &format!("command -v {name}")])
+            .ok()
+            .filter(|(ok, _)| *ok)
+            .map(|(_, t)| t.trim().to_string())
+            .unwrap_or_default();
+        let (missing, version) = match run_cmd(name, &[arg]) {
+            Ok((true, t)) => (false, first_version(&t)),
+            Ok((false, t)) => (true, t.lines().next().unwrap_or("").trim().to_string()),
+            Err(_) => (true, String::new()),
+        };
+        out.push((name, version, path, missing));
+    }
+    out
+}
+
+/// Downloads the newest yt-dlp and deno releases into ~/.local/bin, where they
+/// shadow the system copies (extend_path() gives ~/.local/bin priority).
+/// Needs no root and works the same on every distro. Returns a report for the UI.
+pub fn update_runtime_deps() -> String {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return "no HOME directory - cannot install".into();
+    };
+    let bin = home.join(".local/bin");
+    if let Err(e) = std::fs::create_dir_all(&bin) {
+        return format!("cannot create {}: {e}", bin.display());
+    }
+    let mut out: Vec<String> = Vec::new();
+
+    // ---- yt-dlp (single self-contained Linux binary) ----
+    let tmp = bin.join(".yt-dlp.dl");
+    let _ = std::fs::remove_file(&tmp);
+    match http_download(YTDLP_LINUX_URL, &tmp) {
+        Ok(()) => {
+            let dst = bin.join("yt-dlp");
+            if let Err(e) = std::fs::rename(&tmp, &dst).map_err(|e| e.to_string()).and_then(|_| set_exec(&dst)) {
+                out.push(format!("yt-dlp install failed: {e}"));
+            } else {
+                match run_cmd(dst.to_str().unwrap_or("yt-dlp"), &["--version"]) {
+                    Ok((true, t)) => out.push(format!("yt-dlp {} installed to {}", t.trim(), dst.display())),
+                    Ok((false, t)) => out.push(format!("yt-dlp installed but does not run: {}", t.trim())),
+                    Err(e) => out.push(format!("yt-dlp installed but cannot run it: {e}")),
+                }
+            }
+        }
+        Err(e) => out.push(format!("yt-dlp update failed: {e}")),
+    }
+
+    // ---- deno (zip archive holding one binary) ----
+    let zip = bin.join(".deno.zip");
+    let _ = std::fs::remove_file(&zip);
+    let stage = bin.join(".deno-unpack");
+    let _ = std::fs::remove_dir_all(&stage);
+    match http_download(DENO_LINUX_URL, &zip) {
+        Ok(()) => {
+            let extracted = run_cmd("unzip", &["-o", zip.to_str().unwrap_or(""), "-d", stage.to_str().unwrap_or("")])
+                .map(|(ok, _)| ok)
+                .unwrap_or(false)
+                || run_cmd(
+                    "python3",
+                    &["-c", &format!("import zipfile;zipfile.ZipFile({zip:?}).extractall({stage:?})")],
+                )
+                .map(|(ok, _)| ok)
+                .unwrap_or(false);
+            if extracted {
+                if let Some(b) = find_file(&stage, "deno") {
+                    let dst = bin.join("deno");
+                    let moved = std::fs::rename(&b, &dst)
+                        .or_else(|_| std::fs::copy(&b, &dst).map(|_| ()))
+                        .map_err(|e| e.to_string())
+                        .and_then(|_| set_exec(&dst));
+                    match moved {
+                        Ok(()) => match run_cmd(dst.to_str().unwrap_or("deno"), &["--version"]) {
+                            Ok((true, t)) => {
+                                let v = t.trim().strip_prefix("deno ").unwrap_or(t.trim());
+                                out.push(format!("deno {v} installed to {}", dst.display()))
+                            }
+                            Ok((false, t)) => out.push(format!("deno installed but does not run: {}", t.trim())),
+                            Err(e) => out.push(format!("deno installed but cannot run it: {e}")),
+                        },
+                        Err(e) => out.push(format!("deno install failed: {e}")),
+                    }
+                } else {
+                    out.push("deno zip did not contain the deno binary".into());
+                }
+            } else {
+                out.push("could not extract deno.zip - install unzip or python3".into());
+            }
+        }
+        Err(e) => out.push(format!("deno update failed: {e}")),
+    }
+    let _ = std::fs::remove_dir_all(&stage);
+    let _ = std::fs::remove_file(&zip);
+    let _ = std::fs::remove_file(&tmp);
+
+    out.push("Restart Rustym so the running mpv picks the new copies up.".into());
+    out.join("\n")
+}
+
+/// Streams a URL into a file (GitHub releases redirect; ureq follows).
+fn http_download(url: &str, dest: &PathBuf) -> Result<(), String> {
+    let resp = ureq::get(url).call().map_err(|e| e.to_string())?;
+    let mut f = std::fs::File::create(dest).map_err(|e| e.to_string())?;
+    let mut reader = resp.into_reader().take(1024 * 1024 * 1024);
+    std::io::copy(&mut reader, &mut f).map_err(|e| e.to_string())?;
+    f.sync_all().ok();
+    Ok(())
+}
+
+fn set_exec(p: &PathBuf) -> Result<(), String> {
+    let mut perms = std::fs::metadata(p).map_err(|e| e.to_string())?.permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(p, perms).map_err(|e| e.to_string())
+}
+
+/// Finds a file called `name` up to two directory levels deep.
+fn find_file(dir: &std::path::Path, name: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_file() && p.file_name().map(|f| f == name).unwrap_or(false) {
+            return Some(p);
+        }
+    }
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        if e.path().is_dir() {
+            if let Some(found) = find_file(&e.path(), name) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
 fn run_cmd(prog: &str, args: &[&str]) -> Result<(bool, String), String> {
     let o = Command::new(prog)
         .args(args)

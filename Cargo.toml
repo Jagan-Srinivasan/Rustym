@@ -1,6 +1,6 @@
 [package]
 name = "rustym"
-version = "0.4.0"
+version = "0.0.2"
 edition = "2021"
 license = "GPL-3.0-only"
 repository = "https://github.com/Jagan-Srinivasan/Rustym"
@@ -38,8 +38,10 @@ mpv and yt-dlp. Search, playlists, library, synced lyrics, equalizer,
 visualiser, tray and MPRIS support. Unofficial client, not affiliated
 with Google or YouTube."""
 # $auto adds the shared-library deps detected from the built binaries.
-depends = "$auto, mpv, yt-dlp, ffmpeg, xdg-utils, libgtk-3-0, libwebkit2gtk-4.1-0"
-recommends = "deno, fonts-noto-core"
+# yt-dlp and deno are NOT system deps: current copies are bundled into
+# /usr/lib/rustym/ by CI, and the app can update them from the Settings page.
+depends = "$auto, mpv, ffmpeg, xdg-utils, libgtk-3-0, libwebkit2gtk-4.1-0"
+recommends = "fonts-noto-core"
 section = "sound"
 priority = "optional"
 maintainer-scripts = "packaging/deb"
@@ -51,6 +53,11 @@ assets = [
     # Raster icons: some StatusNotifier tray hosts cannot load the scalable SVG.
     ["packaging/icons/rustym.png", "usr/share/icons/hicolor/128x128/apps/", "644"],
     ["packaging/icons/rustym-64.png", "usr/share/icons/hicolor/64x64/apps/", "644"],
+    # Working copies of the tools YouTube needs, pinned at build time by CI
+    # (see .github/workflows/build.yml). Engine code puts /usr/lib/rustym
+    # first on PATH, so these beat any distro yt-dlp/deno.
+    ["packaging/bundled/yt-dlp", "usr/lib/rustym/", "755"],
+    ["packaging/bundled/deno", "usr/lib/rustym/", "755"],
 ]
 
 [package.metadata.generate-rpm]
@@ -59,7 +66,7 @@ license = "GPL-3.0-only"
 group = "Applications/Multimedia"
 release = 1
 # Fedora package names
-requires = { mpv = "*", yt-dlp = "*", ffmpeg-free = "*", gtk3 = "*", "webkit2gtk4.1" = "*", xdg-utils = "*" }
+requires = { mpv = "*", ffmpeg-free = "*", gtk3 = "*", "webkit2gtk4.1" = "*", xdg-utils = "*" }
 assets = [
     { source = "target/release/rustym", dest = "/usr/bin/rustym", mode = "755" },
     { source = "target/release/rustym-login", dest = "/usr/bin/rustym-login", mode = "755" },
@@ -68,6 +75,9 @@ assets = [
     # Raster icons: some StatusNotifier tray hosts cannot load the scalable SVG.
     { source = "packaging/icons/rustym.png", dest = "/usr/share/icons/hicolor/128x128/apps/rustym.png", mode = "644" },
     { source = "packaging/icons/rustym-64.png", dest = "/usr/share/icons/hicolor/64x64/apps/rustym.png", mode = "644" },
+    # See the .deb note above.
+    { source = "packaging/bundled/yt-dlp", dest = "/usr/lib/rustym/yt-dlp", mode = "755" },
+    { source = "packaging/bundled/deno", dest = "/usr/lib/rustym/deno", mode = "755" },
 ]
 
 [[bin]]

@@ -6,3 +6,6 @@ dist/
 *.rpm
 *.AppImage
 __pycache__/
+
+# Downloaded by CI, never committed
+packaging/bundled/

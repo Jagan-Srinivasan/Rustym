@@ -1,18 +1,21 @@
 # Maintainer: Jagan Srinivasan <jaganrmkcet@gmail.com>
 # Build with: makepkg -f   (then: pacman -U rustym-*.pkg.tar.zst)
 pkgname=rustym
-pkgver=0.4.0
+pkgver=0.0.2
 pkgrel=1
 pkgdesc="Ad-free, feature-rich YouTube Music player for Linux (pure Rust + egui)"
 arch=('x86_64')
 url="https://github.com/Jagan-Srinivasan/Rustym"
 license=('GPL-3.0-only')
-depends=('mpv' 'yt-dlp' 'ffmpeg' 'gtk3' 'webkit2gtk-4.1' 'libxkbcommon' 'libx11' 'libxcursor'
+depends=('mpv' 'ffmpeg' 'gtk3' 'webkit2gtk-4.1' 'libxkbcommon' 'libx11' 'libxcursor'
          'libxrandr' 'libxi' 'wayland' 'fontconfig' 'noto-fonts' 'xdg-utils')
-optdepends=('deno: JavaScript runtime used by yt-dlp to solve YouTube stream challenges')
-makedepends=('cargo' 'pkgconf')
-source=("$pkgname-$pkgver.tar.gz::https://github.com/Jagan-Srinivasan/Rustym/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+# yt-dlp and deno are bundled by CI (see package()); the app can also fetch
+# newer copies into ~/.local/bin from its Settings page.
+makedepends=('cargo' 'pkgconf' 'unzip')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/Jagan-Srinivasan/Rustym/archive/refs/tags/v$pkgver.tar.gz"
+        "yt-dlp::https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux"
+        "deno.zip::https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip")
+sha256sums=('SKIP' 'SKIP' 'SKIP')
 
 # The source tarball extracts as Rustym-<ver> (repo name); CI checkouts use rustym-<ver>.
 _srcdir() {
@@ -44,6 +47,10 @@ package() {
     # Raster icons: some StatusNotifier tray hosts cannot load the scalable SVG.
     install -Dm644 packaging/icons/rustym.png "$pkgdir/usr/share/icons/hicolor/128x128/apps/rustym.png"
     install -Dm644 packaging/icons/rustym-64.png "$pkgdir/usr/share/icons/hicolor/64x64/apps/rustym.png"
+    # Bundled yt-dlp + deno (downloaded by makepkg as extra sources). The app
+    # puts /usr/lib/rustym first on PATH, so these beat the distro copies.
+    install -Dm755 "$srcdir/yt-dlp" "$pkgdir/usr/lib/rustym/yt-dlp"
+    install -Dm755 "$srcdir/deno" "$pkgdir/usr/lib/rustym/deno"
     mkdir -p "$pkgdir/usr/share/applications"
     sed 's|@BIN@|/usr/bin|g' packaging/rustym.desktop.in > "$pkgdir/usr/share/applications/rustym.desktop"
     chmod 644 "$pkgdir/usr/share/applications/rustym.desktop"

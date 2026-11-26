@@ -41,6 +41,20 @@ jobs:
           mkdir -p target
           sed 's|@BIN@|/usr/bin|g' packaging/rustym.desktop.in > target/rustym.desktop
 
+      # Bundle working copies of yt-dlp + deno into the packages at
+      # /usr/lib/rustym/ (the app prefers them over the distro copies).
+      # Distro yt-dlp is often years old and gets 403s from YouTube.
+      - name: Bundle yt-dlp + deno
+        run: |
+          mkdir -p packaging/bundled
+          curl -fsSL -o packaging/bundled/yt-dlp https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux
+          curl -fsSL -o /tmp/deno.zip https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip
+          unzip -o /tmp/deno.zip -d /tmp/deno-bin
+          mv /tmp/deno-bin/deno packaging/bundled/deno
+          chmod +x packaging/bundled/yt-dlp packaging/bundled/deno
+          packaging/bundled/yt-dlp --version
+          packaging/bundled/deno --version
+
       - name: Build .deb (cargo-deb)
         run: |
           cargo install --locked cargo-deb
@@ -71,8 +85,9 @@ jobs:
     steps:
       - name: Install build + runtime dependencies
         run: |
-          # makepkg checks the runtime deps too, so install them as well
-          pacman -Syu --noconfirm --needed git rust webkit2gtk-4.1 gtk3 pkgconf \
+          # makepkg checks the runtime deps too, so install them as well.
+          # unzip: makepkg uses it to extract the bundled deno.zip source.
+          pacman -Syu --noconfirm --needed git rust webkit2gtk-4.1 gtk3 pkgconf unzip \
             mpv yt-dlp ffmpeg noto-fonts xdg-utils
 
       - uses: actions/checkout@v4
@@ -81,22 +96,28 @@ jobs:
         run: |
           VER=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
           cp packaging/PKGBUILD .
+          # Working copies shipped inside the package (/usr/lib/rustym/).
+          YTDLP_URL="https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux"
+          DENO_URL="https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip"
 
           if [ "$GITHUB_REF_TYPE" != tag ]; then
-            # Not a tag: build from this checkout instead of the tag tarball
-            sed -i 's|^source=.*|source=()|; s|^sha256sums=.*|sha256sums=()|' PKGBUILD
-            mkdir -p src/rustym-$VER
+            # Not a tag: build from this checkout. Pack the checkout into a
+            # source tarball with the same top-level layout makepkg expects
+            # (rustym-$VER/), and let makepkg fetch yt-dlp + deno itself.
             tar --exclude=./target --exclude=./dist --exclude=./.git \
-                --exclude=./src/rustym-$VER -cf - . | tar -xf - -C src/rustym-$VER
+                --exclude=./packaging/bundled --exclude=./rustym-$VER.tar.gz \
+                --transform "s,^\./,rustym-$VER/," -czf rustym-$VER.tar.gz .
+            sed -i "s|^source=.*|source=(\"rustym-$VER.tar.gz\" \"yt-dlp::$YTDLP_URL\" \"deno.zip::$DENO_URL\")|" PKGBUILD
+            sed -i "s|^sha256sums=.*|sha256sums=('SKIP' 'SKIP' 'SKIP')|" PKGBUILD
           else
             # Tag build: point PKGBUILD at the tarball of the pushed tag itself.
             # The tag name need not match Cargo.toml's version (e.g. v0.0.2 while
-            # the crate is 0.4.0), and GitHub tag tarballs extract as
+            # the crate was 0.4.0), and GitHub tag tarballs extract as
             # <repo>-<tag-without-v>, so align pkgver with the tag for _srcdir().
             TAGVER="${GITHUB_REF_NAME#v}"
             sed -i "s/^pkgver=.*/pkgver=$TAGVER/" PKGBUILD
-            sed -i "s|^source=.*|source=(\"$pkgname-$TAGVER.tar.gz::$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/archive/refs/tags/$GITHUB_REF_NAME.tar.gz\")|" PKGBUILD
-            sed -i "s|^sha256sums=.*|sha256sums=('SKIP')|" PKGBUILD
+            sed -i "s|^source=.*|source=(\"rustym-$TAGVER.tar.gz::$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/archive/refs/tags/$GITHUB_REF_NAME.tar.gz\" \"yt-dlp::$YTDLP_URL\" \"deno.zip::$DENO_URL\")|" PKGBUILD
+            sed -i "s|^sha256sums=.*|sha256sums=('SKIP' 'SKIP' 'SKIP')|" PKGBUILD
           fi
 
           useradd -m builder

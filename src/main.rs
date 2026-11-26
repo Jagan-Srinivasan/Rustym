@@ -144,6 +144,8 @@ enum Msg {
     Local(Vec<Track>),
     /// Something changed in the YouTube library: reload the playlist list.
     LibraryChanged,
+    /// Finished updating yt-dlp / deno from Settings > Dependencies.
+    Deps(String),
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -1132,6 +1134,11 @@ struct Rustym {
     toast: Option<(String, Instant)>,
     local_tracks: Vec<Track>,
     local_input: String,
+    /// Settings > Dependencies: detected versions + paths of the runtime deps.
+    deps_info: Vec<engine::DepRow>,
+    deps_loaded: bool,
+    deps_busy: bool,
+    deps_report: String,
     show_queue: bool,
     fx_open: bool,
     help_open: bool,
@@ -1243,6 +1250,10 @@ impl Rustym {
             toast: None,
             local_tracks: vec![],
             local_input: String::new(),
+            deps_info: vec![],
+            deps_loaded: false,
+            deps_busy: false,
+            deps_report: String::new(),
             show_queue: false,
             fx_open: false,
             help_open: false,
@@ -1513,6 +1524,9 @@ impl Rustym {
         self.status.clear();
         self.req += 1;
         self.loading = false;
+        if v == View::Settings {
+            self.deps_loaded = false; // re-detect versions on entry
+        }
         match v {
             View::Home => self.label = "Home".into(),
             View::Playlists => {
@@ -1730,6 +1744,11 @@ impl Rustym {
                     self.cfg.save();
                 }
                 Msg::Toast(t) => self.toast = Some((t, Instant::now())),
+                Msg::Deps(report) => {
+                    self.deps_busy = false;
+                    self.deps_report = report;
+                    self.deps_info = engine::dep_report();
+                }
                 Msg::SpotifyImported(name, tracks) => {
                     if tracks.is_empty() {
                         self.toast = Some(("No Spotify tracks could be matched".into(), Instant::now()));
@@ -3239,31 +3258,60 @@ impl Rustym {
                 }
             });
 
+            // ---------- Dependencies ----------
+            Self::settings_group(ui, th, "Dependencies", |ui| {
+                if !self.deps_loaded {
+                    self.deps_info = engine::dep_report();
+                    self.deps_loaded = true;
+                }
+                ui.label(
+                    RichText::new("Runtime tools Rustym and mpv need for YouTube. Bundled and user-updated copies always beat the distro's.")
+                        .size(11.5)
+                        .color(th.dim),
+                );
+                ui.add_space(8.0);
+                let green = Color32::from_rgb(80, 210, 130);
+                let red = Color32::from_rgb(255, 92, 92);
+                for (name, ver, path, missing) in &self.deps_info {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("●").color(if *missing { red } else { green }));
+                        ui.label(RichText::new(*name).strong().size(13.5).color(th.text));
+                        ui.label(RichText::new(if *missing { "not found".into() } else { ver.clone() })
+                            .size(13.0).color(if *missing { red } else { th.dim2 }));
+                        if !path.is_empty() {
+                            ui.label(RichText::new(path.clone()).monospace().size(11.0).color(th.dim));
+                        }
+                    });
+                }
+                ui.add_space(10.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.add_enabled(!self.deps_busy, accent_button(th, "Update yt-dlp & deno")).clicked() {
+                        self.deps_busy = true;
+                        self.deps_report = "Downloading the newest yt-dlp and deno…".into();
+                        self.bg(ctx, || Msg::Deps(engine::update_runtime_deps()));
+                    }
+                    if self.deps_busy {
+                        ui.add_space(4.0);
+                        spin(ui, th);
+                        ui.label(RichText::new("Updating…").color(th.dim));
+                    }
+                });
+                if !self.deps_report.is_empty() {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(&self.deps_report).monospace().size(11.5).color(th.dim2));
+                }
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("Installs the newest yt-dlp and deno into ~/.local/bin — no root needed, works on any distro (Arch, Debian/Ubuntu, Fedora). They take priority over the system copies.")
+                        .size(11.5)
+                        .color(th.dim),
+                );
+            });
+            ui.add_space(10.0);
+
             // ---------- Maintenance ----------
             Self::settings_group(ui, th, "Maintenance", |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    if ui.add(accent_button(th, "Update yt-dlp")).clicked() {
-                        self.toast = Some(("Updating yt-dlp…".into(), Instant::now()));
-                        self.bg(ctx, || {
-                            let out = std::process::Command::new("yt-dlp").arg("-U").output();
-                            match out {
-                                Ok(o) => {
-                                    let s = format!(
-                                        "{}{}",
-                                        String::from_utf8_lossy(&o.stdout),
-                                        String::from_utf8_lossy(&o.stderr)
-                                    );
-                                    let last = s.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").to_string();
-                                    if o.status.success() {
-                                        Msg::Toast(format!("yt-dlp: {last}"))
-                                    } else {
-                                        Msg::Toast(format!("yt-dlp -U failed: {last}"))
-                                    }
-                                }
-                                Err(e) => Msg::Toast(format!("yt-dlp -U failed: {e}")),
-                            }
-                        });
-                    }
                     if ui.button("Clear artwork cache").clicked() {
                         self.img.forget_all();
                         let loaders = ctx.loaders();
@@ -3624,10 +3672,19 @@ fn run_gui() -> ! {
 /// on PATH, even though a terminal does. Add them so mpv can always find yt-dlp and deno.
 fn extend_path() {
     let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else { return };
-    let mut dirs: Vec<std::path::PathBuf> = std::env::var_os("PATH")
-        .map(|p| std::env::split_paths(&p).collect())
-        .unwrap_or_default();
-    for extra in [home.join(".local/bin"), home.join(".deno/bin"), home.join(".cargo/bin"), "/usr/local/bin".into()] {
+    // Managed copies of yt-dlp / deno win over the distro's, which is often
+    // years old and gets 403s from YouTube: first the user-updated ones in
+    // ~/.local/bin (Settings > Dependencies), then the copies bundled into the
+    // packages at /usr/lib/rustym. Every child process inherits this, including
+    // mpv's ytdl_hook script that resolves the stream URLs.
+    let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+    for extra in [home.join(".local/bin"), "/usr/lib/rustym".into()] {
+        if extra.is_dir() {
+            dirs.push(extra);
+        }
+    }
+    dirs.extend(std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect::<Vec<_>>()).unwrap_or_default());
+    for extra in [home.join(".deno/bin"), home.join(".cargo/bin"), "/usr/local/bin".into()] {
         if extra.is_dir() && !dirs.contains(&extra) {
             dirs.push(extra);
         }

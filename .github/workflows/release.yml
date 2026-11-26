@@ -1,0 +1,75 @@
+# Manual release pipeline: bump the version everywhere, tag it, and let
+# build.yml do the rest (it triggers on v* tags: builds .deb/.rpm/.pkg.tar.zst
+# and publishes a GitHub release with auto-generated release notes).
+#
+# Usage: Actions -> Release -> Run workflow -> enter the version (e.g. 0.0.2).
+
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, without the leading v (e.g. 0.0.2)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  tag:
+    name: Bump version and tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate version
+        env:
+          V: ${{ inputs.version }}
+        run: |
+          echo "$V" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$' || {
+            echo "::error::Version must look like 0.0.2 (got '$V')"; exit 1;
+          }
+
+      - name: Bump version files (Cargo.toml, Cargo.lock, PKGBUILD)
+        env:
+          V: ${{ inputs.version }}
+        run: |
+          sed -i "s/^version = \".*\"/version = \"$V\"/" Cargo.toml
+          sed -i "s/^pkgver=.*/pkgver=$V/" packaging/PKGBUILD
+          python3 - <<'EOF'
+          import os, re
+          v = os.environ["V"]
+          s = open("Cargo.lock").read()
+          s2, n = re.subn(
+              r'(\[\[package\]\]\nname = "rustym"\nversion = ")[^"]+(")',
+              lambda m: m.group(1) + v + m.group(2), s)
+          assert n == 1, "rustym entry not found in Cargo.lock"
+          open("Cargo.lock", "w").write(s2)
+          print("Cargo.lock: rustym ->", v)
+          EOF
+          grep -m1 '^version' Cargo.toml
+          grep -m1 '^pkgver' packaging/PKGBUILD
+
+      - name: Commit, tag and push
+        env:
+          V: ${{ inputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock packaging/PKGBUILD
+          if git diff --cached --quiet; then
+            echo "Version is already $V - only tagging"
+          else
+            git commit -m "Release v$V"
+          fi
+          git tag -f "v$V"
+          git push origin HEAD:main
+          git push origin "v$V"
+
+      - name: What happens next
+        run: |
+          echo "Tag pushed. build.yml now builds .deb, .rpm and .pkg.tar.zst"
+          echo "and publishes the GitHub release v${{ inputs.version }} with"
+          echo "auto-generated release notes and all packages attached."
