@@ -107,8 +107,7 @@ jobs:
             tar --exclude=./target --exclude=./dist --exclude=./.git \
                 --exclude=./packaging/bundled --exclude=./rustym-$VER.tar.gz \
                 --transform "s,^\./,rustym-$VER/," -czf rustym-$VER.tar.gz .
-            sed -i "s|^source=.*|source=(\"rustym-$VER.tar.gz\" \"yt-dlp::$YTDLP_URL\" \"deno.zip::$DENO_URL\")|" PKGBUILD
-            sed -i "s|^sha256sums=.*|sha256sums=('SKIP' 'SKIP' 'SKIP')|" PKGBUILD
+            APP_SRC="rustym-$VER.tar.gz"
           else
             # Tag build: point PKGBUILD at the tarball of the pushed tag itself.
             # The tag name need not match Cargo.toml's version (e.g. v0.0.2 while
@@ -116,9 +115,22 @@ jobs:
             # <repo>-<tag-without-v>, so align pkgver with the tag for _srcdir().
             TAGVER="${GITHUB_REF_NAME#v}"
             sed -i "s/^pkgver=.*/pkgver=$TAGVER/" PKGBUILD
-            sed -i "s|^source=.*|source=(\"rustym-$TAGVER.tar.gz::$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/archive/refs/tags/$GITHUB_REF_NAME.tar.gz\" \"yt-dlp::$YTDLP_URL\" \"deno.zip::$DENO_URL\")|" PKGBUILD
-            sed -i "s|^sha256sums=.*|sha256sums=('SKIP' 'SKIP' 'SKIP')|" PKGBUILD
+            APP_SRC="rustym-$TAGVER.tar.gz::$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/archive/refs/tags/$GITHUB_REF_NAME.tar.gz"
           fi
+          # Rewrite the source array (it may span several lines) and checksums.
+          export APP_SRC YTDLP_URL DENO_URL
+          python3 - <<'PYEOF'
+          import os, re
+          s = open("PKGBUILD").read()
+          src = 'source=("{}" "yt-dlp::{}" "deno.zip::{}")\n'.format(
+              os.environ["APP_SRC"], os.environ["YTDLP_URL"], os.environ["DENO_URL"])
+          s, n = re.subn(r'source=\([^)]*\)\n', src, s, count=1)
+          assert n == 1, "source array not found in PKGBUILD"
+          s, n = re.subn(r"sha256sums=\([^)]*\)", "sha256sums=('SKIP' 'SKIP' 'SKIP')", s, count=1)
+          assert n == 1, "sha256sums not found in PKGBUILD"
+          open("PKGBUILD", "w").write(s)
+          PYEOF
+          grep '^source=' PKGBUILD
 
           useradd -m builder
           chown -R builder:builder .
