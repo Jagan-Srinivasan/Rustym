@@ -157,17 +157,37 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           pattern: packages-*
           merge-multiple: true
           path: dist
 
-      - name: Create release
+      # Publish the release with the packages attached. Two situations are
+      # handled:
+      #  - no release yet: create it. If releases/v<TAG>.md exists in the repo
+      #    it is used as the notes, otherwise GitHub's auto-generated notes.
+      #  - the release already exists (created manually beforehand, e.g. a
+      #    draft): `gh release create` would fail, so fall back to replacing
+      #    the assets with --clobber and keep the existing notes.
+      - name: Create or update release
         run: |
           ls -l dist/
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "Rustym $GITHUB_REF_NAME" \
-            --generate-notes
+          NOTES="--generate-notes"
+          if [ -f "releases/$GITHUB_REF_NAME.md" ]; then
+            NOTES="--notes-file=releases/$GITHUB_REF_NAME.md"
+            echo "Using pre-written release notes from releases/$GITHUB_REF_NAME.md"
+          fi
+          if gh release create "$GITHUB_REF_NAME" dist/* \
+               --title "Rustym $GITHUB_REF_NAME" $NOTES; then
+            echo "Release created with $(ls dist | wc -l) assets"
+          else
+            echo "Release already exists - replacing its assets"
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          fi
+          gh release view "$GITHUB_REF_NAME" \
+            --json assets --jq '[.assets[].name]'
         env:
           GH_TOKEN: ${{ github.token }}
