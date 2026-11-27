@@ -1360,6 +1360,7 @@ impl Rustym {
 
         let available = ui.available_width().max(320.0);
         let available_height = ui.available_height();
+        let page_h = available_height; // whole page height, before any scroll
         let lyrics_shown = self.lyrics_enabled;
         let wide = available >= 980.0;
         // What goes into the right pane on wide windows:
@@ -1383,7 +1384,18 @@ impl Rustym {
         let playing = self.snap.playing && !self.snap.paused;
         let liked = self.liked_ids.contains(&t.id);
 
-        egui::Frame::none()
+        // The card and the visualiser live inside a scroll area, so a very long
+        // song title can never clip anything: when the card grows taller than
+        // the page, the visualiser (still sized to the space actually left)
+        // becomes reachable by scrolling instead of being cut in half at the
+        // panel edge. The visualiser's height is computed from the card's
+        // MEASURED height, not from ui.available_height() (which stops being
+        // reliable inside a scroll area).
+        egui::ScrollArea::vertical()
+            .id_salt("now-playing-page")
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+        let card = egui::Frame::none()
             .fill(th.card)
             .rounding(24.0)
             .inner_margin(Margin::same(20.0))
@@ -1498,15 +1510,14 @@ impl Rustym {
                         ui.add_space(12.0);
                         ui.allocate_ui_with_layout(Vec2::new(pane_width, column_height), Layout::top_down(Align::Center), |ui| {
                             if show_vinyl_pane {
-                                // Fixed vinyl: the size comes from the pane's own
-                                // stable height (never from the changing card
-                                // content next to it) and is clamped so the disc
-                                // + its mini equaliser always fit inside the pane
-                                // region. It is then centred in the pane, so it
-                                // always sits in the same spot.
-                                let vsize = (column_height - 96.0).min(pane_width).clamp(120.0, 420.0);
-                                let vtotal = vsize + 64.0; // disc + equaliser strip
-                                ui.add_space(((column_height - vtotal) / 2.0).max(0.0));
+                                // Fixed vinyl: its size comes ONLY from the artwork
+                                // column size (art_side), which is stable while the
+                                // window is stable — never from the changing card
+                                // content or the visualiser toggle next to it. It is
+                                // anchored to the top of the pane, so it always sits
+                                // in exactly the same spot, and the clamp keeps the
+                                // disc + its mini equaliser inside the pane region.
+                                let vsize = (art_side - 96.0).min(pane_width).clamp(120.0, 420.0);
                                 let disp = self.disp.clone();
                                 vinyl(ui, th, vsize, playing, &disp);
                             } else {
@@ -1568,24 +1579,33 @@ impl Rustym {
                     }
                 }
             });
+        let card_h = card.response.rect.height();
 
         if self.cfg.show_visualiser {
             ui.add_space(18.0);
             let style = self.cfg.viz;
             let vw = (ui.available_width() - 28.0).max(200.0);
-            // Stretch the visualiser to fill whatever vertical space is left above the
-            // bottom player (frame margins 24 + header ~14 + gap 8 + page bottom pad 6),
-            // so no dead band remains between the visualiser and the player bar.
-            // But never taller than the space actually left: a long song title makes
-            // the Now Playing card grow, and the old fixed minimum (116/148 px) made
-            // the visualiser extend past the panel edge and get clipped in half.
-            let free = ui.available_height() - 24.0 - 14.0 - 8.0 - 6.0;
-            let vh = free.max(64.0);
+            // Give the visualiser frame EXACTLY the space left between the card
+            // and the player bar (6 px breathing pad at the bottom). The bars
+            // area is whatever remains inside the frame after its own margins,
+            // header row and spacing, measured from the real cursor position —
+            // so the bars always fill the frame with no dead band and the frame
+            // never extends past the panel edge.
+            // ui.available_height() cannot be used here: inside the scroll area
+            // it is the viewport height, not the space left below the card, so
+            // the size comes from the page height and the card's measured
+            // height. When the card is taller than the page (very long title),
+            // the floor keeps a 96 px visualiser and the scroll area above
+            // makes it reachable instead of clipping it in half.
+            let total_h = (page_h - card_h - 18.0).max(96.0) - 6.0;
             egui::Frame::none()
                 .fill(th.panel)
                 .rounding(18.0)
                 .inner_margin(Margin::symmetric(14.0, 12.0))
                 .show(ui, |ui| {
+                    ui.set_min_height((total_h - 24.0).max(52.0));
+                    ui.set_width(vw);
+                    let content_top = ui.cursor().top();
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("AUDIO VISUALISER").size(10.0).strong().color(th.dim));
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1599,6 +1619,8 @@ impl Rustym {
                         });
                     });
                     ui.add_space(8.0);
+                    let header_used = ui.cursor().top() - content_top;
+                    let vh = ((total_h - 24.0) - header_used - 6.0).max(40.0);
                     let resp = draw_viz(ui, th, &self.disp, style, Vec2::new(vw, vh));
                     if resp.clicked() {
                         self.cfg.viz = (self.cfg.viz + 1) % 3;
@@ -1606,6 +1628,7 @@ impl Rustym {
                     }
                 });
         }
+        });
     }
     
     fn draw_lyrics(&mut self, ui: &mut egui::Ui) {
