@@ -1498,7 +1498,15 @@ impl Rustym {
                         ui.add_space(12.0);
                         ui.allocate_ui_with_layout(Vec2::new(pane_width, column_height), Layout::top_down(Align::Center), |ui| {
                             if show_vinyl_pane {
-                                let vsize = pane_width.min(column_height - 90.0).max(150.0);
+                                // Fixed vinyl: the size comes from the pane's own
+                                // stable height (never from the changing card
+                                // content next to it) and is clamped so the disc
+                                // + its mini equaliser always fit inside the pane
+                                // region. It is then centred in the pane, so it
+                                // always sits in the same spot.
+                                let vsize = (column_height - 96.0).min(pane_width).clamp(120.0, 420.0);
+                                let vtotal = vsize + 64.0; // disc + equaliser strip
+                                ui.add_space(((column_height - vtotal) / 2.0).max(0.0));
                                 let disp = self.disp.clone();
                                 vinyl(ui, th, vsize, playing, &disp);
                             } else {
@@ -1565,11 +1573,14 @@ impl Rustym {
             ui.add_space(18.0);
             let style = self.cfg.viz;
             let vw = (ui.available_width() - 28.0).max(200.0);
-            let min_vh = if style == 2 { 148.0 } else { 116.0 };
             // Stretch the visualiser to fill whatever vertical space is left above the
             // bottom player (frame margins 24 + header ~14 + gap 8 + page bottom pad 6),
             // so no dead band remains between the visualiser and the player bar.
-            let vh = (ui.available_height() - 24.0 - 14.0 - 8.0 - 6.0).max(min_vh);
+            // But never taller than the space actually left: a long song title makes
+            // the Now Playing card grow, and the old fixed minimum (116/148 px) made
+            // the visualiser extend past the panel edge and get clipped in half.
+            let free = ui.available_height() - 24.0 - 14.0 - 8.0 - 6.0;
+            let vh = free.max(64.0);
             egui::Frame::none()
                 .fill(th.panel)
                 .rounding(18.0)
