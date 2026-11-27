@@ -3880,12 +3880,13 @@ checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
 name = "rustym"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "eframe",
  "egui_extras",
  "image",
  "ksni",
+ "libc",
  "rand 0.8.8",
  "serde",
  "serde_json",

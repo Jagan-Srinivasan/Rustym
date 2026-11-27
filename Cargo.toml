@@ -1,6 +1,6 @@
 [package]
 name = "rustym"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2021"
 license = "GPL-3.0-only"
 repository = "https://github.com/Jagan-Srinivasan/Rustym"
@@ -23,6 +23,10 @@ souvlaki = { version = "0.7", optional = true }
 # in-app Google sign-in window (needs webkit2gtk-4.1 + gtk3 installed); builds the `rustym-login` helper
 wry = { version = "0.47", optional = true }
 tao = { version = "0.30", optional = true }
+
+# malloc_trim: give freed allocator pages back to the OS so the RSS stays low.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [features]
 default = ["mpris", "webview-login"]

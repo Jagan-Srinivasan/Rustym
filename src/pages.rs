@@ -1369,33 +1369,15 @@ impl Rustym {
         let lyrics_ready = self.lyrics.as_ref().map_or(false, |l| !l.synced.is_empty() || !l.plain.trim().is_empty());
         let show_lyrics_pane = wide && lyrics_shown && (lyrics_ready || self.lyrics_loading);
         let show_vinyl_pane = wide && (!show_lyrics_pane || self.vinyl_open);
-        let inner_width = (available - 40.0).max(240.0);
 
         // When the visualiser is hidden, use the full vertical space left by the
         // top bar and bottom player (small breathing margin only).
         let expanded_height = !self.cfg.show_visualiser;
-        let card_content_height = if expanded_height { (available_height - 26.0).max(300.0) } else { 0.0 };
         let wide_pane = show_lyrics_pane || show_vinyl_pane;
-        let art_side = if expanded_height && wide_pane {
-            ((card_content_height - 40.0).min(inner_width * 0.36)).clamp(280.0, 420.0)
-        } else if available >= 900.0 {
-            280.0
-        } else {
-            (available * 0.38).clamp(150.0, 230.0)
-        };
-        let info_width = if wide_pane {
-            340.0_f32.min((inner_width - art_side - 320.0).max(250.0))
-        } else {
-            (inner_width - art_side - 28.0).max(190.0)
-        };
-        // The hero row is: art | info | pane, joined by item spacing + our own
-        // add_space calls (~70 px total). Size the pane to what really remains
-        // so it can never push past the card edge.
-        let pane_width = if wide_pane {
-            (inner_width - art_side - info_width - 70.0).max(200.0)
-        } else {
-            0.0
-        };
+        let (art_side, info_width, pane_width) =
+            hero_widths(available, available_height, expanded_height, wide_pane);
+        let inner_width = (available - 40.0).max(240.0);
+        let card_content_height = if expanded_height { (available_height - 26.0).max(300.0) } else { 0.0 };
         let card_min_height = if expanded_height { card_content_height } else { 0.0 };
         let column_height = if expanded_height { card_content_height - 40.0 } else { art_side }.max(art_side);
         let playing = self.snap.playing && !self.snap.paused;
@@ -1442,7 +1424,12 @@ impl Rustym {
                     }
                     ui.add_space(16.0);
                     // Hero actions: big accent play pill + ring buttons.
-                    ui.horizontal(|ui| {
+                    // Wrapped, and never wider than the info column: the row is
+                    // ~430 px unwrapped (pill + 7 rings), so on narrow / compact
+                    // cards it used to overflow the card and drag the whole
+                    // Now Playing card outside the window.
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
                         let label = if playing { "❚❚  Pause" } else { "▶  Play" };
                         if ui.add(play_pill(th, label)).clicked() {
                             let _ = s.cmd.send(Cmd::Toggle);
@@ -1677,5 +1664,85 @@ impl Rustym {
         if let Some(t) = seek {
             let _ = self.cmd.send(Cmd::Seek(t));
         }
+    }
+}
+
+/// Hero-row sizing for the Now Playing card: `(art_side, info_width, pane_width)`.
+/// Pure so the tests below can prove the row never overflows the card: the row
+/// is art | info | pane joined by ~70 px of gaps on wide layouts and ~28 px in
+/// compact, so the info and pane columns only get what remains after the
+/// artwork, and the artwork shrinks before any column can push the card past
+/// the window edge. (The old fixed 250/200/190 px minimums overflowed the card
+/// on narrow windows, and the unwrapped play/pause row overflowed on top of
+/// that — dragging the whole card outside the display.)
+fn hero_widths(available: f32, available_height: f32, expanded_height: bool, wide_pane: bool) -> (f32, f32, f32) {
+    let inner_width = (available - 40.0).max(240.0);
+    const COMPACT_GAP: f32 = 28.0;
+    const WIDE_GAP: f32 = 70.0;
+    const INFO_FLOOR: f32 = 120.0;
+
+    let card_content_height = if expanded_height { (available_height - 26.0).max(300.0) } else { 0.0 };
+    let mut art_side = if expanded_height && wide_pane {
+        ((card_content_height - 40.0).min(inner_width * 0.36)).clamp(280.0, 420.0)
+    } else if available >= 900.0 {
+        280.0
+    } else {
+        (available * 0.38).clamp(150.0, 230.0)
+    };
+
+    if wide_pane {
+        // Same idea as compact: shrink the artwork before any column overflows.
+        art_side = art_side.min((inner_width - WIDE_GAP - INFO_FLOOR).max(150.0));
+        let free = (inner_width - art_side - WIDE_GAP).max(0.0);
+        let pane_floor = 160.0_f32.min(free * 0.45); // pane shrinks with the window
+        let info = (free - pane_floor).min(340.0).max(INFO_FLOOR.min(free));
+        let pane = (free - info).max(0.0);
+        (art_side, info, pane)
+    } else {
+        // Compact: shrink the artwork first so the info column keeps at least
+        // INFO_FLOOR when the window allows it.
+        art_side = art_side.min((inner_width - COMPACT_GAP - INFO_FLOOR).max(150.0));
+        let info = (inner_width - art_side - COMPACT_GAP).max(0.0);
+        (art_side, info, 0.0)
+    }
+}
+
+#[cfg(test)]
+mod hero_width_tests {
+    use super::hero_widths;
+
+    /// The hero row must fit inside the card on every window width, every
+    /// layout (wide pane / compact pane, expanded / visualiser height).
+    #[test]
+    fn hero_row_never_overflows() {
+        for available in [320.0, 400.0, 500.0, 646.0, 700.0, 860.0, 980.0, 1180.0, 1400.0, 1920.0, 3000.0] {
+            for expanded_height in [true, false] {
+                for wide_pane in [true, false] {
+                    for ah in [500.0, 760.0, 1200.0] {
+                        let (art, info, pane) = hero_widths(available, ah, expanded_height, wide_pane);
+                        let inner = (available - 40.0).max(240.0);
+                        let gap = if wide_pane { 70.0 } else { 28.0 };
+                        let total = art + gap + info + pane;
+                        assert!(
+                            total <= inner + 0.5,
+                            "available={available} expanded={expanded_height} wide={wide_pane}: \
+                             row {art} + {gap} + {info} + {pane} = {total} > card {inner}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// On realistic window widths the info column keeps usable room for the
+    /// play/pause row and the wrapped ring buttons.
+    #[test]
+    fn info_column_stays_usable() {
+        // Minimum app window: 860 px wide minus the 214 px sidebar.
+        let (_, info, _) = hero_widths(646.0, 760.0, true, false);
+        assert!(info >= 300.0, "compact info column {info} too narrow");
+        // Wide window with all panes open.
+        let (_, info, pane) = hero_widths(1180.0, 760.0, true, true);
+        assert!(info >= 250.0 && pane >= 160.0, "wide columns {info}/{pane} too narrow");
     }
 }

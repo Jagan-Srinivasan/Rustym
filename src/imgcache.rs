@@ -22,16 +22,22 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Total decoded-bytes budget for the whole cache.
-const BUDGET: usize = 96 * 1024 * 1024;
+/// Total decoded-bytes budget for the whole cache. Kept small on purpose:
+/// decoded covers are held once, but egui keeps texture handles alive with
+/// them, so the 16 MB cap (plus the raw-bytes cache that rides along) keeps
+/// the window process' RSS well under the 100 MB target.
+const BUDGET: usize = 16 * 1024 * 1024;
 /// Entries unused for this long are evicted by the app-side janitor.
 pub const STALE: Duration = Duration::from_secs(45);
 /// How often the loader runs its internal sweep.
 const SWEEP: Duration = Duration::from_secs(3);
 /// Failed downloads are retried after this long.
 const RETRY: Duration = Duration::from_secs(30);
-/// Never decode wider/taller than this (Now Playing art is at most ~420 px).
-const MAX_DECODE_SIDE: u32 = 1280;
+/// Never decode wider/taller than this. The largest UI tile is the Now
+/// Playing artwork at ~420 px; covering a 420 px box from a 16:9 source
+/// needs ~750 px on the long side, so 800 keeps it sharp without ever
+/// holding a full 1280x720 frame.
+const MAX_DECODE_SIDE: u32 = 800;
 /// Minimum decode size, so tiny hints don't produce blurry upscales.
 const MIN_SIDE: u32 = 96;
 

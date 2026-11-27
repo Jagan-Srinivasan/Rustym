@@ -21,7 +21,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, Ordering::SeqCst},
         mpsc::{channel, Receiver, Sender},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
     time::{Duration, Instant},
 };
@@ -755,13 +755,13 @@ fn setup_fonts(ctx: &egui::Context) {
         "/usr/share/fonts/truetype",
         "/usr/share/fonts/opentype",
     ];
-    // File-name stems, in priority order. Bengali first.
+    // File-name stems, in priority order. Bengali first. (The heavy CJK
+    // fallbacks are discovered below but only loaded when needed.)
     let stems = [
         "NotoSansBengali", "NotoSansBengaliUI",
         "NotoSansDevanagari", "NotoSansTamil", "NotoSansTelugu", "NotoSansKannada",
         "NotoSansMalayalam", "NotoSansGujarati", "NotoSansGurmukhi", "NotoSansOriya",
-        "NotoSansSinhala", "NotoSansArabic", "NotoSansThai", "NotoSansCJK-Regular",
-        "NotoSansCJKjp-Regular",
+        "NotoSansSinhala", "NotoSansArabic", "NotoSansThai",
     ];
     let mut found: Vec<PathBuf> = Vec::new();
     let push = |p: PathBuf, found: &mut Vec<PathBuf>| {
@@ -777,9 +777,25 @@ fn setup_fonts(ctx: &egui::Context) {
         }
     }
     // Fontconfig lookups cover fonts in unusual locations or with other names.
+    // The Indic / Arabic / Thai fallbacks together are only ~2 MB, so they stay
+    // part of the startup set; the ~19 MB CJK .ttc is discovered here but kept
+    // for lazy loading (CJK_FONT_FILES), see `font_cjk_needed` / `load_cjk_fonts`.
+    let mut cjk: Vec<PathBuf> = Vec::new();
+    let push_cjk = |p: PathBuf, cjk: &mut Vec<PathBuf>| {
+        if p.is_file() && !cjk.contains(&p) {
+            cjk.push(p);
+        }
+    };
+    for stem in ["NotoSansCJK-Regular", "NotoSansCJKjp-Regular"] {
+        for d in dirs {
+            for ext in ["-Regular.ttc", ".ttc", ".ttf", ".otf", "-Regular.otf"] {
+                push_cjk(Path::new(d).join(format!("{stem}{ext}")), &mut cjk);
+            }
+        }
+    }
     for query in [
         ":lang=bn", ":lang=hi", ":lang=ta", ":lang=te", ":lang=kn", ":lang=ml",
-        ":lang=gu", ":lang=pa", ":lang=or", ":lang=si", ":lang=ar", ":lang=th", ":lang=ja",
+        ":lang=gu", ":lang=pa", ":lang=or", ":lang=si", ":lang=ar", ":lang=th",
     ] {
         if let Ok(out) = std::process::Command::new("fc-match")
             .args(["-f", "%{file}", query])
@@ -793,6 +809,19 @@ fn setup_fonts(ctx: &egui::Context) {
             }
         }
     }
+    // A CJK font for the lazy loader, even when the stems above did not match.
+    if let Ok(out) = std::process::Command::new("fc-match")
+        .args(["-f", "%{file}", ":lang=ja"])
+        .output()
+    {
+        if out.status.success() {
+            let f = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !f.is_empty() {
+                push_cjk(PathBuf::from(f), &mut cjk);
+            }
+        }
+    }
+    let _ = CJK_FONT_FILES.set(cjk.iter().map(|p| p.to_string_lossy().to_string()).collect());
 
     for (i, p) in found.iter().enumerate() {
         if let Ok(bytes) = std::fs::read(p) {
@@ -851,7 +880,51 @@ fn setup_fonts(ctx: &egui::Context) {
         }
     }
     eprintln!("[rustym] fonts: {} system fallback fonts loaded: {:?}", found.len(), found);
+    let _ = BASE_FONTS.set(fonts.clone());
     ctx.set_fonts(fonts);
+}
+
+/// CJK codepoints that need the heavy NotoSansCJK fallback. That .ttc is
+/// ~19 MB, so it is only loaded once CJK characters actually appear in the
+/// displayed text (titles, artists, lyrics, account names…).
+fn font_cjk_needed(s: &str) -> bool {
+    s.chars().any(|c| {
+        let u = c as u32;
+        (0x2E80..=0x9FFF).contains(&u) // CJK radicals, kana, ideographs
+            || (0xAC00..=0xD7AF).contains(&u) // Hangul syllables
+            || (0xF900..=0xFAFF).contains(&u) // CJK compatibility ideographs
+            || (0xFF00..=0xFFEF).contains(&u) // fullwidth forms (＋, 　, …)
+    })
+}
+
+static CJK_FONT_FILES: OnceLock<Vec<String>> = OnceLock::new();
+static CJK_FONTS_LOADED: AtomicBool = AtomicBool::new(false);
+/// Font definitions without the heavy CJK fallbacks (the startup set).
+static BASE_FONTS: OnceLock<FontDefinitions> = OnceLock::new();
+
+/// Registers the discovered CJK fallback fonts (once). Rebuilding the font
+/// definitions is safe any time; egui just rebuilds its glyph atlas.
+fn load_cjk_fonts(ctx: &egui::Context) {
+    use std::path::Path;
+    if CJK_FONTS_LOADED.swap(true, SeqCst) {
+        return;
+    }
+    let Some(paths) = CJK_FONT_FILES.get() else { return };
+    let Some(base) = BASE_FONTS.get() else { return };
+    let mut fonts = base.clone();
+    for (i, p) in paths.iter().enumerate() {
+        if let Ok(bytes) = std::fs::read(Path::new(p)) {
+            let name = format!("sysfont-cjk-{i}");
+            fonts.font_data.insert(name.clone(), FontData::from_owned(bytes));
+            for fam in [FontFamily::Proportional, FontFamily::Monospace] {
+                if let Some(f) = fonts.families.get_mut(&fam) {
+                    f.push(name.clone());
+                }
+            }
+        }
+    }
+    ctx.set_fonts(fonts);
+    log(0, "fonts", "CJK fallback fonts loaded");
 }
 
 fn fake_levels(t: f32) -> Vec<f32> {
@@ -1154,7 +1227,8 @@ struct Rustym {
     tray_ok: bool,
     tray_checked: Instant,
     last_current_id: String,
-    startup_minimise_pending: bool,
+    /// Set when the track changes or text is typed: run the lazy CJK font check.
+    cjk_check: bool,
 }
 
 impl Rustym {
@@ -1265,7 +1339,7 @@ impl Rustym {
             tray_ok: true,
             tray_checked: Instant::now(),
             last_current_id: String::new(),
-            startup_minimise_pending: true,
+            cjk_check: true,
         };
         let _ = app.cmd.send(Cmd::Shuffle(app.cfg.shuffle));
         let _ = app.cmd.send(Cmd::SetRepeat(app.cfg.repeat));
@@ -3200,7 +3274,7 @@ impl Rustym {
                     };
                     ui.label(RichText::new(txt).size(12.0).color(col));
                 }
-                if Self::settings_toggle(ui, th, &mut self.cfg.start_minimised, "Start minimised", "Restore from the tray or task switcher when you need the window.") {
+                if Self::settings_toggle(ui, th, &mut self.cfg.start_minimised, "Start minimised", "Starts in the background with just the tray icon — nothing pops up on the desktop, at sign-in or when you launch it. Open the window from the tray.") {
                     self.cfg.save();
                 }
                 let auto_before = self.cfg.start_at_login;
@@ -3564,6 +3638,45 @@ impl eframe::App for Rustym {
                     }
                 }
             }
+            // glibc keeps freed pages in the arena, so the RSS never came down
+            // even after every cache released its buffers. Hand freed pages
+            // back to the OS on every janitor pass.
+            #[cfg(target_os = "linux")]
+            unsafe {
+                libc::malloc_trim(0);
+            }
+        }
+        // The ~19 MB CJK fallback font is loaded lazily, the first time CJK
+        // text can appear (new track, lyrics, typed text, account names…).
+        // Checked on track changes and each janitor pass; the scan is cheap.
+        if !CJK_FONTS_LOADED.load(SeqCst)
+            && (self.cjk_check || self.img_t.elapsed() > Duration::from_secs(15))
+        {
+            self.cjk_check = false;
+            let mut texts: Vec<&str> = Vec::new();
+            if let Some(t) = &self.snap.current {
+                texts.push(&t.title);
+                texts.push(&t.artist);
+                texts.push(&t.album);
+            }
+            texts.push(self.query.as_str());
+            texts.push(self.cfg.account_name.as_str());
+            for t in &self.tracks {
+                texts.push(&t.title);
+                texts.push(&t.artist);
+            }
+            for p in &self.cfg.playlists {
+                texts.push(&p.name);
+            }
+            if let Some(l) = &self.lyrics {
+                texts.push(&l.plain);
+                for s in &l.synced {
+                    texts.push(&s.text);
+                }
+            }
+            if texts.iter().any(|s| font_cjk_needed(s)) {
+                load_cjk_fonts(ctx);
+            }
         }
         // Visualiser lifecycle: run the audio capture only while shown.
         if self.cfg.show_visualiser && self.viz.is_none() {
@@ -3584,17 +3697,19 @@ impl eframe::App for Rustym {
         let current_id = self.snap.current.as_ref().map(|t| t.id.clone()).unwrap_or_default();
         if !current_id.is_empty() && current_id != self.last_current_id {
             self.last_current_id = current_id;
+            self.cjk_check = true; // new track: CJK may have appeared in the text
             self.back.clear();
             self.view = View::Now;
             self.label = "Now playing".into();
         }
         // Minimise only once, after the first backend snapshot has arrived.
-        if self.startup_minimise_pending {
-            self.startup_minimise_pending = false;
-            if self.cfg.start_minimised {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-            }
-        }
+        // Note: the window process never self-minimises any more. Wayland
+        // compositors ignore an app's own minimize request before the window is
+        // mapped (so "start minimised" looked broken — the window appeared
+        // anyway), and a fresh window process spawned by the tray restore would
+        // have minimised itself again, making "show window" look dead. The
+        // background process owns this decision: with "Start minimised" it
+        // simply never spawns the window at sign-in.
         self.update_levels();
 
         self.housekeeping(ctx);
@@ -3750,6 +3865,18 @@ fn main() {
 
     // ----- background process: engine + tray + media keys + control socket; windows are child processes -----
     let cfg = Config::load();
+    // "Start minimised": a cold start stays in the background with just the
+    // tray icon, so nothing pops up on the desktop at sign-in (the autostart
+    // entry runs `rustym --show`, so this must win over --show too). The window
+    // process cannot reliably minimise itself on Wayland — compositors ignore
+    // an app's own minimize request before the window is mapped — so not
+    // opening the window at all is the dependable behaviour. If no tray shows
+    // up within 10 s the fallback below still opens a window, so the person is
+    // never left with nothing.
+    let start_minimised = cfg.start_minimised;
+    if start_minimised {
+        start_hidden = true;
+    }
     let (cmd, shared) = spawn_engine(cfg.volume, Arc::new(|| {}));
     let _ = cmd.send(Cmd::Shuffle(cfg.shuffle));
     let _ = cmd.send(Cmd::SetRepeat(cfg.repeat));
