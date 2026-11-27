@@ -1,7 +1,7 @@
 # Maintainer: Jagan Srinivasan <jaganrmkcet@gmail.com>
 # Build with: makepkg -f   (then: pacman -U rustym-*.pkg.tar.zst)
 pkgname=rustym
-pkgver=0.0.4
+pkgver=0.0.5
 pkgrel=1
 pkgdesc="Ad-free, feature-rich YouTube Music player for Linux (pure Rust + egui)"
 arch=('x86_64')

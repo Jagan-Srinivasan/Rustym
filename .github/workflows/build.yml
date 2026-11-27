@@ -70,6 +70,8 @@ jobs:
           mkdir -p dist
           cp target/debian/*.deb dist/
           cp target/generate-rpm/*.rpm dist/
+          # Never ship debug packages (cargo-deb may emit -dbgsym variants).
+          find dist -maxdepth 1 -type f \( -name '*-dbgsym*' -o -name '*-debug*' \) -print -delete
           ls -l dist/
 
       - uses: actions/upload-artifact@v4
@@ -141,6 +143,8 @@ jobs:
           su builder -c "makepkg -f --noconfirm"
           mkdir -p dist
           cp rustym-*.pkg.tar.zst dist/
+          # PKGBUILD sets options=('!debug'); drop any stray -debug package anyway.
+          find dist -maxdepth 1 -type f -name '*-debug*' -print -delete
           ls -l dist/
 
       - uses: actions/upload-artifact@v4
@@ -172,6 +176,14 @@ jobs:
       #  - the release already exists (created manually beforehand, e.g. a
       #    draft): `gh release create` would fail, so fall back to replacing
       #    the assets with --clobber and keep the existing notes.
+      #
+      # Only real packages are published: any -debug / -dbgsym packages that a
+      # build step might have produced are dropped here, they never belong on
+      # the release page.
+      - name: Drop debug packages
+        run: |
+          find dist -maxdepth 1 -type f \( -name '*-debug*' -o -name '*-dbgsym*' \) -print -delete
+          ls -l dist/
       - name: Create or update release
         run: |
           ls -l dist/
