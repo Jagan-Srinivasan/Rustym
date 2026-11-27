@@ -30,6 +30,31 @@ pub(crate) fn play_pill(th: Theme, label: &str) -> egui::Button<'static> {
         .rounding(15.0)
 }
 
+/// Play / Pause pill for the Now Playing hero, with a FIXED width: both
+/// labels are measured up front and the wider one is reserved, so toggling
+/// playback can never reflow the hero actions row. ("❚❚ Pause" is wider than
+/// "▶ Play" — the width change used to shift every ring button and was
+/// reported as "the vinyl player moves when the play button changes".)
+pub(crate) fn play_pause_pill(ui: &egui::Ui, th: Theme, playing: bool) -> egui::Button<'static> {
+    let fg = if th.light { Color32::WHITE } else { Color32::from_rgb(20, 15, 11) };
+    let font = FontId::proportional(14.5);
+    let pad = ui.style().spacing.button_padding.x;
+    let w = ui.ctx().fonts(|f| {
+        let pause = f.layout_no_wrap("❚❚  Pause".to_owned(), font.clone(), Color32::WHITE).rect.width();
+        let play = f.layout_no_wrap("▶  Play".to_owned(), font, Color32::WHITE).rect.width();
+        pause.max(play) + 2.0 * pad + 2.0
+    });
+    egui::Button::new(
+        RichText::new(if playing { "❚❚  Pause" } else { "▶  Play" })
+            .size(14.5)
+            .strong()
+            .color(fg),
+    )
+    .fill(th.accent)
+    .rounding(15.0)
+    .min_size(Vec2::new(w, 0.0))
+}
+
 /// Small outlined circle button (heart / lyrics / visualiser / queue).
 fn ring_btn(ui: &mut egui::Ui, th: Theme, glyph: &str, active: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::click());
@@ -1442,8 +1467,7 @@ impl Rustym {
                     // Now Playing card outside the window.
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
-                        let label = if playing { "❚❚  Pause" } else { "▶  Play" };
-                        if ui.add(play_pill(th, label)).clicked() {
+                        if ui.add(play_pause_pill(ui, th, playing)).clicked() {
                             let _ = s.cmd.send(Cmd::Toggle);
                         }
                         if ring_btn(ui, th, "♥", liked).clicked() && t.local.is_empty() {
